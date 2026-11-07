@@ -684,10 +684,16 @@ impl Editor {
         }
 
         if self.media.is_some() {
+            // Holding a timeline-click modifier (default Ctrl = start, Shift = end)
+            // puts that point where you click, and dragging keeps moving it.
+            let mods = ui.input(|i| i.modifiers);
+            let click_mark = if self.can_mark() { self.settings.keybinds.click_action(mods) } else { None };
             if resp.drag_started() || resp.clicked() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     self.drag = Some(Drag::Scrub);
-                    if let Some((s, e)) = range {
+                    if let Some(a) = click_mark {
+                        self.drag = Some(if a == Action::TimelineStart { Drag::Start } else { Drag::End });
+                    } else if let Some((s, e)) = range {
                         if (p.x - x_of(s)).abs() < 8.0 {
                             self.drag = Some(Drag::Start);
                         } else if (p.x - x_of(e)).abs() < 8.0 {
@@ -717,12 +723,32 @@ impl Editor {
             }
             if let Some(p) = resp.hover_pos() {
                 let near_handle = range.is_some_and(|(s, e)| (p.x - x_of(s)).abs() < 8.0 || (p.x - x_of(e)).abs() < 8.0);
-                ui.ctx().set_cursor_icon(if near_handle { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::PointingHand });
+                ui.ctx().set_cursor_icon(if near_handle || click_mark.is_some() { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::PointingHand });
+                // Show where the start/end would land.
+                if let Some(a) = click_mark {
+                    let x = p.x.clamp(rect.left(), rect.right());
+                    painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], Stroke::new(2.0, theme::CORAL));
+                    let label = format!("{} {}", if a == Action::TimelineStart { "Start" } else { "End" }, timecode::format_short(t_of(x)));
+                    let (lx, align) = if x > rect.right() - 90.0 { (x - 5.0, egui::Align2::RIGHT_TOP) } else { (x + 5.0, egui::Align2::LEFT_TOP) };
+                    painter.text(egui::pos2(lx, rect.top() + 3.0), align, label, egui::FontId::proportional(11.5), Color32::WHITE);
+                }
             }
         }
+        let click_hint = |a: Action| self.settings.keybinds.get(a).map(|b| b.display());
+        let hint = match (click_hint(Action::TimelineStart), click_hint(Action::TimelineEnd)) {
+            (Some(s), Some(e)) => format!("{s}: set start  ·  {e}: set end"),
+            (Some(s), None) => format!("{s}: set start"),
+            (None, Some(e)) => format!("{e}: set end"),
+            (None, None) => String::new(),
+        };
         ui.horizontal(|ui| {
             let mono = |t: f64| RichText::new(timecode::format_short(t)).small().monospace().color(theme::MUTED);
-            ui.label(mono(0.0));
+            let left = ui.label(mono(0.0)).rect;
+            if self.media.is_some() && !hint.is_empty() {
+                // Centred under the timeline, regardless of the end-time label's width.
+                let y = left.center().y;
+                ui.painter().text(egui::pos2(rect.center().x, y), egui::Align2::CENTER_CENTER, &hint, egui::FontId::proportional(12.0), theme::MUTED);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(mono(duration));
             });

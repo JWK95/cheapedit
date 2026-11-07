@@ -131,6 +131,11 @@ impl KeymapUi {
             egui::Grid::new("binds").num_columns(3).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
                 for a in Action::ALL {
                     ui.label(a.label());
+                    if a.is_click() {
+                        self.click_row(ui, kb, a);
+                        ui.end_row();
+                        continue;
+                    }
                     let text = if self.capturing == Some(a) {
                         RichText::new("Press a key…  (Esc cancels)").color(theme::CORAL)
                     } else {
@@ -162,10 +167,46 @@ impl KeymapUi {
                     ui.selectable_value(&mut self.layer, l, l.label());
                 }
             });
-            theme::hint(ui, "Highlighted keys do something. Dim keys are free — click one to give it an action.");
+            theme::hint(ui, "Highlighted keys do something. Dim keys are free — click one to give it an action. Timeline clicks are set above.");
             ui.add_space(6.0);
             self.keyboard(ui, kb);
         });
+    }
+
+    /// A timeline-click action: pick which modifier to hold while clicking.
+    /// A plain click is not offered — that always scrubs the timeline.
+    fn click_row(&mut self, ui: &mut egui::Ui, kb: &mut Keybinds, a: Action) {
+        const CHOICES: [Modifiers; 6] = [
+            Modifiers::CTRL,
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers { ctrl: true, shift: true, ..Modifiers::NONE },
+            Modifiers { ctrl: true, alt: true, ..Modifiers::NONE },
+            Modifiers { shift: true, alt: true, ..Modifiers::NONE },
+        ];
+        let current = kb.get(a).map(|b| b.display()).unwrap_or_else(|| "Not set".into());
+        let resp = ui.add(egui::Button::new(RichText::new(current).monospace()).min_size(egui::vec2(200.0, 0.0))).on_hover_text("Choose the key to hold while clicking the timeline");
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.label(RichText::new("Hold this while clicking the timeline:").strong());
+            for m in CHOICES {
+                let b = Binding::click(m);
+                if ui.button(b.display()).clicked() {
+                    match kb.conflict(&b, a) {
+                        Some(other) => self.conflict = Some((a, b, other)),
+                        None => {
+                            kb.map.insert(a, b);
+                        }
+                    }
+                    ui.close();
+                }
+            }
+        });
+        let default = Keybinds::default_for(a);
+        if ui.add_enabled(kb.get(a) != default.as_ref(), egui::Button::new("Reset").small()).clicked() {
+            if let Some(d) = default {
+                kb.assign_swapping(a, d);
+            }
+        }
     }
 
     fn keyboard(&mut self, ui: &mut egui::Ui, kb: &mut Keybinds) {
@@ -227,7 +268,7 @@ impl KeymapUi {
             None => {
                 egui::Popup::menu(&resp).show(|ui| {
                     ui.label(RichText::new(format!("Assign {combo} to…")).strong());
-                    for a in Action::ALL {
+                    for a in Action::ALL.into_iter().filter(|a| !a.is_click()) {
                         let current = kb.get(a).map(|b| b.display()).unwrap_or_else(|| "not set".into());
                         if ui.button(format!("{}  (now {current})", a.label())).clicked() {
                             kb.map.insert(a, Binding::new(key, mods));

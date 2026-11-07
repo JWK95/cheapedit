@@ -18,10 +18,14 @@ pub enum Action {
     Export,
     OpenFile,
     ShowShortcuts,
+    /// Modifier + click on the timeline sets the start there.
+    TimelineStart,
+    /// Modifier + click on the timeline sets the end there.
+    TimelineEnd,
 }
 
 impl Action {
-    pub const ALL: [Action; 11] = [
+    pub const ALL: [Action; 13] = [
         Action::PlayPause,
         Action::FrameBack,
         Action::FrameForward,
@@ -33,7 +37,13 @@ impl Action {
         Action::Export,
         Action::OpenFile,
         Action::ShowShortcuts,
+        Action::TimelineStart,
+        Action::TimelineEnd,
     ];
+    /// Bound to a modifier + mouse click on the timeline, not to a key.
+    pub fn is_click(self) -> bool {
+        matches!(self, Action::TimelineStart | Action::TimelineEnd)
+    }
     pub fn label(self) -> &'static str {
         match self {
             Action::PlayPause => "Play / pause",
@@ -47,6 +57,8 @@ impl Action {
             Action::Export => "Export clip",
             Action::OpenFile => "Open video",
             Action::ShowShortcuts => "Show shortcuts",
+            Action::TimelineStart => "Click timeline: set start",
+            Action::TimelineEnd => "Click timeline: set end",
         }
     }
     /// Short label for the on-screen keyboard.
@@ -63,6 +75,8 @@ impl Action {
             Action::Export => "Export",
             Action::OpenFile => "Open",
             Action::ShowShortcuts => "Keys",
+            Action::TimelineStart => "start",
+            Action::TimelineEnd => "end",
         }
     }
     /// Shown in the strip under the player.
@@ -89,6 +103,18 @@ impl Binding {
     }
     fn plain(key: Key) -> Binding {
         Binding::new(key, Modifiers::NONE)
+    }
+    /// Name used for "mouse click" bindings. It's not a key name, so a click
+    /// binding can never be triggered from the keyboard.
+    pub const CLICK: &'static str = "Click";
+    pub fn click(m: Modifiers) -> Binding {
+        Binding { key: Self::CLICK.into(), ctrl: m.ctrl || m.command, shift: m.shift, alt: m.alt }
+    }
+    pub fn is_click(&self) -> bool {
+        self.key == Self::CLICK
+    }
+    pub fn matches_click(&self, m: Modifiers) -> bool {
+        self.is_click() && self.ctrl == (m.ctrl || m.command) && self.shift == m.shift && self.alt == m.alt
     }
     pub fn key(&self) -> Option<Key> {
         Key::from_name(&self.key)
@@ -151,6 +177,8 @@ impl Default for Keybinds {
         map.insert(Action::Export, Binding::new(Key::E, ctrl));
         map.insert(Action::OpenFile, Binding::new(Key::O, ctrl));
         map.insert(Action::ShowShortcuts, Binding::plain(Key::F1));
+        map.insert(Action::TimelineStart, Binding::click(ctrl));
+        map.insert(Action::TimelineEnd, Binding::click(shift));
         Keybinds { map }
     }
 }
@@ -170,6 +198,10 @@ impl Keybinds {
     }
     pub fn get(&self, a: Action) -> Option<&Binding> {
         self.map.get(&a)
+    }
+    /// Which timeline-click action (if any) these held modifiers select.
+    pub fn click_action(&self, m: Modifiers) -> Option<Action> {
+        self.map.iter().find(|(a, b)| a.is_click() && b.matches_click(m)).map(|(a, _)| *a)
     }
     /// Which action (other than `except`) already uses this binding?
     pub fn conflict(&self, b: &Binding, except: Action) -> Option<Action> {
@@ -229,6 +261,26 @@ mod tests {
         let b = Binding::new(Key::ArrowLeft, Modifiers::NONE);
         assert!(b.matches(Key::ArrowLeft, Modifiers::NONE));
         assert!(!b.matches(Key::ArrowLeft, Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn timeline_clicks() {
+        let k = Keybinds::default();
+        assert_eq!(k.click_action(Modifiers::CTRL), Some(Action::TimelineStart));
+        assert_eq!(k.click_action(Modifiers::SHIFT), Some(Action::TimelineEnd));
+        assert_eq!(k.click_action(Modifiers::NONE), None, "a plain click still scrubs");
+        assert_eq!(k.get(Action::TimelineStart).unwrap().display(), "Ctrl+Click");
+        // A click binding never fires from the keyboard.
+        assert!(!k.get(Action::TimelineStart).unwrap().matches(Key::C, Modifiers::CTRL));
+    }
+
+    #[test]
+    fn old_settings_gain_new_actions() {
+        let mut k = Keybinds::default();
+        k.map.remove(&Action::TimelineStart);
+        k.map.remove(&Action::TimelineEnd);
+        k.fill_missing();
+        assert_eq!(k, Keybinds::default());
     }
 
     #[test]

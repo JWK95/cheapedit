@@ -177,6 +177,10 @@ A volume slider (0–200%) appears in every mode that has audio.
 | `I` / `O` | Set start / end |
 | `Ctrl+E` | Export |
 | `Ctrl+O` | Open file |
+| `Ctrl+Click` on the timeline | Set start there (drag to keep moving it) |
+| `Shift+Click` on the timeline | Set end there (drag to keep moving it) |
+
+The timeline-click bindings are rebound by choosing a modifier: Ctrl, Shift, Alt, or a pair of them. A plain click always scrubs. While the modifier is held, a coral line and label show where the point will land, and a hint under the timeline lists both combos.
 
 **Settings → Keybindings page:**
 - a list of every action and its key: click to rebind
