@@ -18,7 +18,13 @@ Set-Location (Split-Path $PSScriptRoot -Parent)
 
 function Step($msg) { Write-Host "`n== $msg" -ForegroundColor Cyan }
 function Fail($msg) { Write-Host "`nSTOPPED: $msg" -ForegroundColor Red; exit 1 }
-function Run($exe, [string[]]$a) { & $exe @a; if ($LASTEXITCODE -ne 0) { Fail "$exe $($a -join ' ') failed (exit $LASTEXITCODE)" } }
+# Tools like cargo and git print progress to stderr; Windows PowerShell 5.1 would
+# treat that as an error, so judge success by the exit code instead.
+function Run($exe, [string[]]$a) {
+    $ErrorActionPreference = 'Continue'
+    & $exe @a 2>&1 | ForEach-Object { "$_" }
+    if ($LASTEXITCODE -ne 0) { Fail "$exe $($a -join ' ') failed (exit $LASTEXITCODE)" }
+}
 
 $Version = $Version.TrimStart('v', 'V')
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { Fail "Version must look like 1.2.3 (got '$Version')." }
