@@ -5,6 +5,7 @@ use crate::formats::{Caps, Container};
 use crate::job::{AvMode, CutMode, Options};
 use crate::probe::MediaInfo;
 use crate::timecode;
+use crate::zoom::{self, Zone, ZoneFix};
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,15 +14,17 @@ pub enum Fix {
     SwitchToPrecise,
     ChooseFolder,
     SwitchToMkv,
+    Zone(ZoneFix),
 }
 
 impl Fix {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Fix::UseEndOfVideo => "Use end of video",
-            Fix::SwitchToPrecise => "Switch to Precise",
-            Fix::ChooseFolder => "Choose folder",
-            Fix::SwitchToMkv => "Switch to MKV",
+            Fix::UseEndOfVideo => "Use end of video".into(),
+            Fix::SwitchToPrecise => "Switch to Precise".into(),
+            Fix::ChooseFolder => "Choose folder".into(),
+            Fix::SwitchToMkv => "Switch to MKV".into(),
+            Fix::Zone(z) => z.label(),
         }
     }
 }
@@ -29,11 +32,11 @@ impl Fix {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Problem {
     pub message: String,
-    pub fix: Option<Fix>,
+    pub fixes: Vec<Fix>,
 }
 
 fn p(message: impl Into<String>, fix: Option<Fix>) -> Problem {
-    Problem { message: message.into(), fix }
+    Problem { message: message.into(), fixes: fix.into_iter().collect() }
 }
 
 pub struct Input<'a> {
@@ -47,6 +50,7 @@ pub struct Input<'a> {
     /// (estimated output bytes, free bytes on the output drive)
     pub space: Option<(u64, u64)>,
     pub dir_writable: bool,
+    pub zones: &'a [Zone],
 }
 
 /// The trim range in seconds, if the boxes make sense.
@@ -116,6 +120,18 @@ pub fn check(i: &Input) -> Vec<Problem> {
         }
     }
 
+    // Zoom zones (ignored for audio-only exports, which have no picture).
+    if !i.zones.is_empty() && o.av != AvMode::AudioOnly && media.video.is_some() {
+        if o.mode == CutMode::Fast {
+            out.push(p("Zoom zones need Precise mode — Fast mode copies the video untouched.", Some(Fix::SwitchToPrecise)));
+        } else {
+            let trim = trim_range(media, i.start_text, i.end_text, i.until_end).ok();
+            for z in zoom::check(i.zones, trim) {
+                out.push(Problem { message: z.message, fixes: z.fixes.into_iter().map(Fix::Zone).collect() });
+            }
+        }
+    }
+
     if let Some((need, free)) = i.space {
         // Leave headroom: estimates are rough and Windows needs space too.
         let need = need + need / 5 + 50_000_000;
@@ -159,6 +175,7 @@ mod tests {
             caps: Some(&caps),
             space: Some((1_000, 10_000_000_000)),
             dir_writable: true,
+            zones: &[],
         })
     }
 
@@ -171,7 +188,7 @@ mod tests {
     fn trim_problems() {
         let m = media("h264");
         assert_eq!(run(&m, "45", "25", &Options::default())[0].message, "Start must be before end.");
-        assert_eq!(run(&m, "25", "1:30", &Options::default())[0].fix, Some(Fix::UseEndOfVideo));
+        assert_eq!(run(&m, "25", "1:30", &Options::default())[0].fixes, vec![Fix::UseEndOfVideo]);
     }
 
     #[test]
@@ -179,7 +196,7 @@ mod tests {
         let o = Options { mode: CutMode::Fast, container: Container::Webm, ..Default::default() };
         let probs = run(&media("hevc"), "1", "2", &o);
         assert_eq!(probs.len(), 1);
-        assert_eq!(probs[0].fix, Some(Fix::SwitchToMkv));
+        assert_eq!(probs[0].fixes, vec![Fix::SwitchToMkv]);
     }
 
     #[test]

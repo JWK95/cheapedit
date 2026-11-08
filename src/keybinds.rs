@@ -22,10 +22,12 @@ pub enum Action {
     TimelineStart,
     /// Modifier + click on the timeline sets the end there.
     TimelineEnd,
+    NewZone,
+    DeleteZone,
 }
 
 impl Action {
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 15] = [
         Action::PlayPause,
         Action::FrameBack,
         Action::FrameForward,
@@ -39,6 +41,8 @@ impl Action {
         Action::ShowShortcuts,
         Action::TimelineStart,
         Action::TimelineEnd,
+        Action::NewZone,
+        Action::DeleteZone,
     ];
     /// Bound to a modifier + mouse click on the timeline, not to a key.
     pub fn is_click(self) -> bool {
@@ -59,6 +63,8 @@ impl Action {
             Action::ShowShortcuts => "Show shortcuts",
             Action::TimelineStart => "Click timeline: set start",
             Action::TimelineEnd => "Click timeline: set end",
+            Action::NewZone => "New zoom zone",
+            Action::DeleteZone => "Delete selected zoom zone",
         }
     }
     /// Short label for the on-screen keyboard.
@@ -77,6 +83,8 @@ impl Action {
             Action::ShowShortcuts => "Keys",
             Action::TimelineStart => "start",
             Action::TimelineEnd => "end",
+            Action::NewZone => "Zone",
+            Action::DeleteZone => "Del zone",
         }
     }
     /// Shown in the strip under the player.
@@ -179,6 +187,8 @@ impl Default for Keybinds {
         map.insert(Action::ShowShortcuts, Binding::plain(Key::F1));
         map.insert(Action::TimelineStart, Binding::click(ctrl));
         map.insert(Action::TimelineEnd, Binding::click(shift));
+        map.insert(Action::NewZone, Binding::plain(Key::Z));
+        map.insert(Action::DeleteZone, Binding::plain(Key::Delete));
         Keybinds { map }
     }
 }
@@ -279,6 +289,7 @@ mod tests {
         let mut k = Keybinds::default();
         k.map.remove(&Action::TimelineStart);
         k.map.remove(&Action::TimelineEnd);
+        k.map.remove(&Action::NewZone);
         k.fill_missing();
         assert_eq!(k, Keybinds::default());
     }

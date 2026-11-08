@@ -32,7 +32,7 @@ fn run_case(ffmpeg: &Path, ffprobe: &Path, caps: &Caps, src: &probe::MediaInfo, 
     let _ = std::fs::remove_file(&out);
     let enc = if o.mode == CutMode::Precise && o.av != AvMode::AudioOnly { caps.pick(o.vcodec, o.use_gpu) } else { None };
     let (start, end) = (1.0, 3.0);
-    let job = Job { media: src, opts: o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale };
+    let job = Job { media: src, opts: o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &[] };
     let args = build_args(&job);
     let res = crate::winutil::hidden_command(ffmpeg).args(&args).output().map_err(|e| e.to_string())?;
     if !res.status.success() {
@@ -129,4 +129,40 @@ fn hdr_source_converts_to_sdr() {
     assert!(src.video.as_ref().unwrap().hdr);
     let case = Case { label: "hdr".into(), opts: Options::default() };
     run_case(&ffmpeg, &ffprobe, &caps, &src, &dir, &case, 999).unwrap();
+}
+
+#[test]
+#[ignore]
+fn zoom_zones_export() {
+    use crate::zoom::{Resolved, ZBox, MAX_ZONES};
+    let (ffmpeg, ffprobe) = (tool("ffmpeg.exe"), tool("ffprobe.exe"));
+    let caps = Caps::detect(&ffmpeg);
+    let dir = std::env::temp_dir().join("cheapedit-it");
+    std::fs::create_dir_all(&dir).unwrap();
+    // A 4 s source; the trim below is 1-3 s. Pack the full 20 zones into it,
+    // mixing smooth, hard and panning zones.
+    let src_path = make_source(&ffmpeg, &dir, "zsrc.mp4", &["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"]);
+    let src = probe::probe(&ffprobe, &src_path).unwrap();
+    let len = 2.0 / MAX_ZONES as f64;
+    let zones: Vec<Resolved> = (0..MAX_ZONES)
+        .map(|i| {
+            let s = 1.0 + i as f64 * len;
+            let glide = if i % 3 == 0 { 0.0 } else { 0.04 };
+            Resolved { start: s, end: s + len, glide, a: ZBox::centered(0.5), b: ZBox { x: 0.0, y: 0.0, s: 0.2 } }
+        })
+        .collect();
+    for (speed, gpu) in [(1.0, false), (2.0, true)] {
+        let o = Options { speed, use_gpu: gpu, ..Default::default() };
+        let out = dir.join(format!("zoom{speed}.mp4"));
+        let _ = std::fs::remove_file(&out);
+        let enc = caps.pick(o.vcodec, o.use_gpu);
+        let job = Job { media: &src, opts: &o, start: 1.0, end: 3.0, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &zones };
+        let args = build_args(&job);
+        let res = crate::winutil::hidden_command(&ffmpeg).args(&args).output().unwrap();
+        assert!(res.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&res.stderr));
+        let info = probe::probe(&ffprobe, &out).unwrap();
+        assert!((info.duration - 2.0 / speed).abs() < 0.25, "duration {}", info.duration);
+        let v = info.video.unwrap();
+        assert_eq!((v.width, v.height), (640, 360), "zoom keeps the size");
+    }
 }

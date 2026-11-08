@@ -13,6 +13,7 @@ use crate::timecode;
 use crate::validate::{self, Fix};
 use crate::video_view::VideoView;
 use crate::winutil;
+use crate::zoom::{self, ZBox, Zone};
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,8 @@ struct PreviewState {
     speed: f64,
     pitch_correct: bool,
     volume: u32,
+    /// Preview-only listening volume (not part of the export).
+    listen: u32,
     mute: bool,
     no_audio: bool,
     no_video: bool,
@@ -50,6 +53,40 @@ struct ExportSig {
     end: String,
     until_end: bool,
     opts: Options,
+    zones: Vec<Zone>,
+}
+
+/// What a drag on the video is doing to the selected zone's box.
+#[derive(Clone, Copy, PartialEq)]
+enum BoxDrag {
+    /// Drawing a new box from this corner (frame fractions).
+    Draw((f64, f64)),
+    /// Resizing from a corner; the opposite corner stays here.
+    Resize((f64, f64)),
+    /// Moving; pointer offset from the box's top-left.
+    Move((f64, f64)),
+}
+
+const ZONE_COLORS: [Color32; 6] = [
+    Color32::from_rgb(0x5e, 0xc8, 0xf0),
+    Color32::from_rgb(0xf0, 0xc7, 0x5e),
+    Color32::from_rgb(0x8b, 0xe0, 0x7a),
+    Color32::from_rgb(0xe0, 0x7a, 0xd8),
+    Color32::from_rgb(0xf0, 0x8a, 0x5e),
+    Color32::from_rgb(0x9a, 0x8c, 0xf5),
+];
+
+fn zone_color(i: usize) -> Color32 {
+    ZONE_COLORS[i % ZONE_COLORS.len()]
+}
+
+/// Where a `w`x`h` video sits inside `rect` (mpv letterboxes it).
+fn fit_rect(rect: egui::Rect, w: f32, h: f32) -> egui::Rect {
+    if w <= 0.0 || h <= 0.0 {
+        return rect;
+    }
+    let scale = (rect.width() / w).min(rect.height() / h);
+    egui::Rect::from_center_size(rect.center(), egui::vec2(w * scale, h * scale))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -95,6 +132,25 @@ pub struct Editor {
     dir_status: (Option<PathBuf>, bool, Option<u64>),
     dir_checked: Instant,
     pending_open: Option<PathBuf>,
+    zones: Vec<Zone>,
+    sel_zone: Option<usize>,
+    /// Editing the selected zone's end box (Pan) rather than its start box.
+    edit_end_box: bool,
+    /// The next drag on the video draws a fresh box.
+    drawing: bool,
+    box_drag: Option<BoxDrag>,
+    /// Dragging a zone band's edge on the timeline: (zone, is start).
+    band_drag: Option<(usize, bool)>,
+    /// The zoom last given to mpv for the live preview.
+    live_zoom: ZBox,
+    /// A file was just loaded: keep checking mpv until its first frame is
+    /// ready, so it shows even while paused.
+    awaiting_frame: Option<Instant>,
+    /// Ghost line: where playback last started (original video time).
+    ghost: Option<f64>,
+    /// Paused last frame, and where; a pause-to-play change sets the ghost.
+    was_paused: bool,
+    paused_pos: f64,
 }
 
 impl Editor {
@@ -149,6 +205,17 @@ impl Editor {
             dir_status: (None, false, None),
             dir_checked: Instant::now() - Duration::from_secs(60),
             pending_open: None,
+            zones: Vec::new(),
+            sel_zone: None,
+            edit_end_box: false,
+            drawing: false,
+            box_drag: None,
+            band_drag: None,
+            live_zoom: ZBox::FULL,
+            awaiting_frame: None,
+            ghost: None,
+            was_paused: true,
+            paused_pos: 0.0,
         }
     }
 
@@ -193,6 +260,35 @@ impl Editor {
         o
     }
 
+    /// Zoom works when the export re-encodes a picture.
+    fn zoom_allowed(&self) -> bool {
+        self.zoom_blocked_reason().is_none()
+    }
+
+    /// Why the zoom tools are greyed out, if they are.
+    fn zoom_blocked_reason(&self) -> Option<&'static str> {
+        let o = self.effective_opts();
+        match &self.media {
+            None => Some("Open a video first."),
+            Some(m) if m.video.is_none() => Some("This file has no picture to zoom."),
+            _ if o.mode == CutMode::Fast => Some("Switch to Precise to zoom. Fast mode copies the video untouched."),
+            _ if o.av == AvMode::AudioOnly => Some("Zoom needs video, and you've chosen Audio only."),
+            _ => None,
+        }
+    }
+
+    /// Zones used by the export and preview (empty when zoom doesn't apply).
+    fn active_zones(&self) -> Vec<zoom::Resolved> {
+        if !self.zoom_allowed() {
+            return Vec::new();
+        }
+        self.zones.iter().filter_map(Zone::resolve).collect()
+    }
+
+    fn zoom_in_name(&self) -> bool {
+        self.zoom_allowed() && !self.zones.is_empty()
+    }
+
     fn caps(&self) -> Option<Caps> {
         self.caps.lock().unwrap().clone()
     }
@@ -217,6 +313,7 @@ impl Editor {
             end: self.end_text.clone(),
             until_end: self.until_end,
             opts: self.effective_opts(),
+            zones: self.zones.clone(),
         })
     }
 
@@ -236,7 +333,7 @@ impl Editor {
         let m = self.media.as_ref()?;
         let (s, e) = self.trim()?;
         let o = self.effective_opts();
-        let name = job::sanitize_name(&self.name_text).unwrap_or_else(|| job::auto_name(&m.path, s, e, o.effective_speed()));
+        let name = job::sanitize_name(&self.name_text).unwrap_or_else(|| job::auto_name(&m.path, s, e, o.effective_speed(), self.zoom_in_name()));
         Some(job::unique_path(dir, &name, o.output_container().ext()))
     }
 
@@ -246,7 +343,7 @@ impl Editor {
         let space = match (&self.media, self.trim(), self.dir_status.2) {
             (Some(m), Some((s, e)), Some(free)) => {
                 let out = PathBuf::new();
-                let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false };
+                let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[] };
                 Some((job::estimate_bytes(&j), free))
             }
             _ => None,
@@ -261,6 +358,7 @@ impl Editor {
             caps: caps.as_ref(),
             space,
             dir_writable: self.dir_status.1,
+            zones: &self.zones,
         })
     }
 
@@ -301,6 +399,11 @@ impl Editor {
                 self.open_error = None;
                 self.applied = None;
                 self.loaded = None;
+                self.zones.clear();
+                self.sel_zone = None;
+                self.drawing = false;
+                self.ghost = None;
+                self.was_paused = true;
                 if m.video.as_ref().is_some_and(|v| v.hdr) {
                     self.log.info("HDR video: exports will be converted to standard colour (SDR).");
                 }
@@ -329,6 +432,14 @@ impl Editor {
             Fix::SwitchToPrecise => self.settings.options.mode = CutMode::Precise,
             Fix::ChooseFolder => self.choose_folder(),
             Fix::SwitchToMkv => self.settings.options.container = Container::Mkv,
+            Fix::Zone(z) => {
+                let trim = self.trim();
+                z.apply(&mut self.zones, trim);
+                if self.sel_zone.is_some_and(|i| i >= self.zones.len()) || matches!(z, zoom::ZoneFix::Delete(_)) {
+                    self.sel_zone = None;
+                    self.drawing = false;
+                }
+            }
         }
     }
 
@@ -342,7 +453,11 @@ impl Editor {
         let o = self.effective_opts();
         let encodes_video = o.mode == CutMode::Precise && o.av != AvMode::AudioOnly && m.video.is_some();
         let enc = if encodes_video { caps.pick(o.vcodec, o.use_gpu) } else { None };
-        let j = Job { media: &m, opts: &o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale };
+        let zones = self.active_zones();
+        let j = Job { media: &m, opts: &o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &zones };
+        if !zones.is_empty() {
+            self.log.info(format!("Zooming {} zone(s)", zones.len()));
+        }
         let args = job::build_args(&j);
         let total = job::output_duration(start, end, o.effective_speed());
         if let Some(e) = enc {
@@ -381,8 +496,104 @@ impl Editor {
             Action::Export => self.start_export(ctx),
             Action::OpenFile => self.open_dialog(),
             Action::ShowShortcuts => self.show_keys = true,
+            Action::NewZone => self.new_zone(),
+            Action::DeleteZone => self.delete_selected_zone(),
             _ => {}
         }
+    }
+
+    fn seek(&self, t: f64) {
+        if let Some(v) = &self.video {
+            v.player.command(&["seek", &t.to_string(), "absolute+exact"]);
+        }
+    }
+
+    fn pause(&self) {
+        if let Some(v) = &self.video {
+            v.player.set_property("pause", "yes");
+        }
+    }
+
+    /// Add a zone at the playhead (inside the trim, after any zone already
+    /// there) and get ready to draw its box.
+    fn new_zone(&mut self) {
+        if !self.zoom_allowed() || self.zones.len() >= zoom::MAX_ZONES {
+            return;
+        }
+        let Some((ts, te)) = self.trim() else { return };
+        let mut times: Vec<(f64, f64)> = self.zones.iter().filter_map(|z| z.times()).collect();
+        times.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut s = self.position().clamp(ts, te);
+        for &(zs, ze) in &times {
+            if s >= zs && s < ze {
+                s = ze;
+            }
+        }
+        let mut e = (s + 5.0).min(te);
+        if let Some(&(next, _)) = times.iter().find(|t| t.0 > s) {
+            e = e.min(next);
+        }
+        if e - s < 1.0 {
+            s = (e - 1.0).max(ts);
+        }
+        self.zones.push(Zone::new(s, e));
+        self.sel_zone = Some(self.zones.len() - 1);
+        self.edit_end_box = false;
+        self.drawing = true;
+        self.view = View::Original;
+        self.pause();
+        self.seek(s);
+    }
+
+    fn delete_selected_zone(&mut self) {
+        if let Some(i) = self.sel_zone.take() {
+            if i < self.zones.len() {
+                self.zones.remove(i);
+            }
+        }
+        self.drawing = false;
+        self.box_drag = None;
+    }
+
+    /// Select a zone and jump to its start.
+    fn select_zone(&mut self, i: usize) {
+        self.sel_zone = Some(i);
+        self.edit_end_box = false;
+        self.drawing = false;
+        if let Some((s, _)) = self.zones.get(i).and_then(|z| z.times()) {
+            self.seek(s);
+        }
+    }
+
+    /// Show zone `i`'s start or end box on the matching frame, ready to
+    /// draw a new one (`draw`) or to move/resize the one there.
+    fn goto_zone_box(&mut self, i: usize, end_box: bool, draw: bool) {
+        self.sel_zone = Some(i);
+        self.edit_end_box = end_box;
+        self.drawing = draw;
+        self.view = View::Original;
+        self.pause();
+        if let Some((s, e)) = self.zones.get(i).and_then(|z| z.times()) {
+            let fps = self.media.as_ref().and_then(|m| m.video.as_ref()).map(|v| v.fps).unwrap_or(30.0).max(1.0);
+            self.seek(if end_box { (e - 1.0 / fps).max(s) } else { s });
+        }
+    }
+
+    /// Remember where playback starts: when the player goes from paused to
+    /// playing, the spot it was paused at becomes the ghost line. Only while
+    /// watching the source, since the exported file has its own timeline.
+    fn track_ghost(&mut self) {
+        if self.media.is_none() || !self.can_mark() {
+            self.was_paused = true;
+            return;
+        }
+        let paused = self.paused();
+        if paused {
+            self.paused_pos = self.position();
+        } else if self.was_paused {
+            self.ghost = Some(self.paused_pos);
+        }
+        self.was_paused = paused;
     }
 
     /// Start/end can be marked while viewing the source (Original, or the live Result preview).
@@ -402,6 +613,7 @@ impl Editor {
             speed: 1.0,
             pitch_correct: true,
             volume: 100,
+            listen: self.settings.preview_volume,
             mute: false,
             no_audio: false,
             no_video: false,
@@ -417,6 +629,7 @@ impl Editor {
                     speed: o.effective_speed(),
                     pitch_correct: !o.change_pitch,
                     volume: if o.mode == CutMode::Fast { 100 } else { o.volume_pct },
+                    listen: self.settings.preview_volume,
                     mute: o.av == AvMode::Mute,
                     no_audio: o.av == AvMode::RemoveAudio,
                     no_video: o.av == AvMode::AudioOnly,
@@ -425,10 +638,35 @@ impl Editor {
         }
     }
 
+    /// The zoom the live Result preview should show right now.
+    fn wanted_live_zoom(&self) -> ZBox {
+        let live = self.view == View::Result && self.exported_file.is_none();
+        if !live || self.settings.zoom_static_preview {
+            return ZBox::FULL;
+        }
+        let zones = self.active_zones();
+        if zones.is_empty() {
+            return ZBox::FULL;
+        }
+        zoom::sample(&zoom::segments(&zones), self.position())
+    }
+
     fn apply_preview(&mut self) {
         // An export made with different settings no longer shows "the result".
         if self.exported_file.is_some() && self.export_sig != self.export_sig() {
             self.exported_file = None;
+        }
+        // Zoom preview: mpv's own zoom and pan, from the same maths as the
+        // FFmpeg filter. Changes every frame, so it's applied separately.
+        let z = self.wanted_live_zoom();
+        if z != self.live_zoom {
+            if let Some(v) = &self.video {
+                let p = &v.player;
+                p.set_property("video-zoom", &(1.0 / z.s).log2().to_string());
+                p.set_property("video-pan-x", &(0.5 - (z.x + z.s / 2.0)).to_string());
+                p.set_property("video-pan-y", &(0.5 - (z.y + z.s / 2.0)).to_string());
+            }
+            self.live_zoom = z;
         }
         let want = self.desired_preview();
         if self.applied.as_ref() == Some(&want) {
@@ -440,12 +678,15 @@ impl Editor {
         if want.file != self.loaded {
             if let Some(f) = &want.file {
                 p.load_file(f);
+                self.awaiting_frame = Some(Instant::now());
             }
             self.loaded = want.file.clone();
         }
         p.set_property("speed", &want.speed.to_string());
         p.set_property("audio-pitch-correction", if want.pitch_correct { "yes" } else { "no" });
-        p.set_property("volume", &want.volume.to_string());
+        // The listening volume scales whatever the export would sound like.
+        let heard = want.volume as u64 * self.settings.preview_volume as u64 / 100;
+        p.set_property("volume", &heard.to_string());
         p.set_property("mute", if want.mute { "yes" } else { "no" });
         p.set_property("aid", if want.no_audio { "no" } else { "auto" });
         p.set_property("vid", if want.no_video { "no" } else { "auto" });
@@ -477,10 +718,24 @@ impl Editor {
         if let Some(p) = self.pending_open.take() {
             self.open(p);
         }
-        if let Some(v) = &self.video {
+        if let Some(v) = &mut self.video {
             let ev = v.player.poll_events();
             if ev.file_loaded {
                 self.applied = None; // re-apply track/loop settings to the new file
+            }
+            if ev.file_loaded || ev.restarted {
+                v.force_frames = 3;
+            }
+            if ev.restarted {
+                self.awaiting_frame = None;
+            }
+        }
+        self.track_ghost();
+        if let Some(t) = self.awaiting_frame {
+            if t.elapsed() < Duration::from_secs(5) {
+                ctx.request_repaint_after(Duration::from_millis(30));
+            } else {
+                self.awaiting_frame = None;
             }
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
@@ -608,15 +863,15 @@ impl Editor {
             });
         });
         if self.view == View::Result && has_media && self.exported_file.is_none() {
-            theme::hint(ui, "Live preview shows your trim, speed and audio choices. Quality and format changes only show in the exported file.");
+            theme::hint(ui, "Live preview shows your trim, speed, audio and zoom choices. Quality and format changes only show in the exported file.");
         }
         ui.add_space(4.0);
 
         // Leave room below the video for the timeline, controls and shortcut strip.
-        let below = 160.0;
+        let below = if self.show_bands() { 182.0 } else { 160.0 };
         let avail = ui.available_size();
         let video_h = (avail.y - below).max(120.0);
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail.x, video_h), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail.x, video_h), Sense::click_and_drag());
         if let Some(v) = &mut self.video {
             if has_media {
                 v.paint(ui, frame, rect);
@@ -643,6 +898,11 @@ impl Editor {
         } else if let Some(e) = &self.open_error {
             ui.painter().text(rect.center_top() + egui::vec2(0.0, 20.0), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(14.0), theme::DANGER);
         }
+        if let Some((w, h)) = self.media.as_ref().and_then(|m| m.video.as_ref()).map(|v| (v.width as f32, v.height as f32)) {
+            if self.video.is_some() {
+                self.zoom_overlay(ui, &resp, rect, fit_rect(rect, w, h));
+            }
+        }
         if resp.clicked() && has_media {
             self.handle_action(Action::PlayPause, &ui.ctx().clone());
         }
@@ -653,6 +913,258 @@ impl Editor {
         self.transport_ui(ui);
         ui.add_space(2.0);
         self.shortcut_strip(ui);
+    }
+
+    /// Zone bands under the timeline: shown while editing the source.
+    fn show_bands(&self) -> bool {
+        !self.zones.is_empty() && !(self.view == View::Result && self.exported_file.is_some())
+    }
+
+    /// Zoom boxes on the video, and dragging them.
+    fn zoom_overlay(&mut self, ui: &mut egui::Ui, resp: &egui::Response, rect: egui::Rect, vr: egui::Rect) {
+        let painter = ui.painter_at(rect);
+        let live = self.view == View::Result && self.exported_file.is_none();
+        // mpv's zoom spills into the black bars; keep the bars black.
+        if live && self.live_zoom != ZBox::FULL {
+            for r in [
+                egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), vr.top())),
+                egui::Rect::from_min_max(egui::pos2(rect.left(), vr.bottom()), rect.max),
+                egui::Rect::from_min_max(egui::pos2(rect.left(), vr.top()), egui::pos2(vr.left(), vr.bottom())),
+                egui::Rect::from_min_max(egui::pos2(vr.right(), vr.top()), egui::pos2(rect.right(), vr.bottom())),
+            ] {
+                painter.rect_filled(r, 0.0, Color32::BLACK);
+            }
+        }
+        if self.zones.is_empty() || !self.zoom_allowed() {
+            return;
+        }
+        let to_screen = |b: ZBox| {
+            egui::Rect::from_min_size(
+                egui::pos2(vr.left() + b.x as f32 * vr.width(), vr.top() + b.y as f32 * vr.height()),
+                egui::vec2(b.s as f32 * vr.width(), b.s as f32 * vr.height()),
+            )
+        };
+        let font = egui::FontId::proportional(12.0);
+        let pos = self.position();
+
+        if live {
+            if self.settings.zoom_static_preview {
+                let b = zoom::sample(&zoom::segments(&self.active_zones()), pos);
+                if b != ZBox::FULL {
+                    let r = to_screen(b);
+                    painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
+                    painter.text(r.left_top() + egui::vec2(5.0, 4.0), egui::Align2::LEFT_TOP, format!("Zoom {:.1}x", b.zoom()), font, Color32::WHITE);
+                }
+            }
+            return;
+        }
+        if self.view != View::Original {
+            return;
+        }
+
+        // Other zones, faintly, while the playhead is inside their time.
+        for (i, z) in self.zones.iter().enumerate() {
+            if Some(i) == self.sel_zone {
+                continue;
+            }
+            if let Some((s, e)) = z.times() {
+                if pos >= s && pos < e && z.a_drawn {
+                    let col = zone_color(i).gamma_multiply(0.55);
+                    let r = to_screen(z.a);
+                    painter.rect_stroke(r, 0.0, Stroke::new(1.5, col), egui::StrokeKind::Inside);
+                    painter.text(r.left_top() + egui::vec2(5.0, 3.0), egui::Align2::LEFT_TOP, format!("{}", i + 1), font.clone(), col);
+                }
+            }
+        }
+
+        let Some(i) = self.sel_zone.filter(|&i| i < self.zones.len()) else { return };
+        let col = zone_color(i);
+        let z = self.zones[i].clone();
+        let end_box = z.pan && self.edit_end_box;
+        let cur = if end_box { z.b } else { z.a };
+        let cur_drawn = if end_box { z.b_drawn } else { z.a_drawn };
+        let other_drawn = if end_box { z.a_drawn } else { z.b_drawn };
+        let r = to_screen(cur);
+        if z.pan && other_drawn {
+            // The other box of the pan, thin, with an arrow showing the move.
+            let other = to_screen(if end_box { z.a } else { z.b });
+            painter.rect_stroke(other, 0.0, Stroke::new(1.0, col.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+            let label = if end_box { "start" } else { "end" };
+            painter.text(other.left_top() + egui::vec2(5.0, 3.0), egui::Align2::LEFT_TOP, label, font.clone(), col.gamma_multiply(0.8));
+            let (from, to) = if end_box { (other.center(), r.center()) } else { (r.center(), other.center()) };
+            if cur_drawn && from.distance(to) > 12.0 {
+                painter.arrow(from, to - from, Stroke::new(1.5, col.gamma_multiply(0.7)));
+            }
+        }
+        if cur_drawn || self.box_drag.is_some() {
+            painter.rect_filled(r, 0.0, col.gamma_multiply(0.08));
+            painter.rect_stroke(r, 0.0, Stroke::new(2.0, col), egui::StrokeKind::Inside);
+            for c in [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()] {
+                painter.rect_filled(egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0)), 1.0, col);
+            }
+            let mut label = format!("Zone {}", i + 1);
+            if z.pan {
+                label.push_str(if end_box { " - end box" } else { " - start box" });
+            }
+            label.push_str(&format!("  {:.1}x", cur.zoom()));
+            painter.text(r.left_top() + egui::vec2(6.0, 5.0), egui::Align2::LEFT_TOP, label, font.clone(), col);
+        }
+        if self.drawing && self.box_drag.is_none() {
+            let which = if z.pan { if end_box { "end box" } else { "start box" } } else { "box" };
+            let msg = format!("Drag on the video to draw zone {}'s {which}", i + 1);
+            let at = egui::pos2(vr.center().x, vr.top() + 18.0);
+            let galley = painter.layout_no_wrap(msg, egui::FontId::proportional(14.0), Color32::WHITE);
+            let bg = egui::Rect::from_center_size(at, galley.size() + egui::vec2(16.0, 8.0));
+            painter.rect_filled(bg, 4.0, Color32::from_black_alpha(190));
+            painter.galley(bg.min + egui::vec2(8.0, 4.0), galley, Color32::WHITE);
+        }
+
+        // ---- interaction
+        let to_frac = |p: egui::Pos2| (((p.x - vr.left()) / vr.width()) as f64, ((p.y - vr.top()) / vr.height()) as f64);
+        let corners = [
+            (r.left_top(), (cur.x + cur.s, cur.y + cur.s), egui::CursorIcon::ResizeNwSe),
+            (r.right_top(), (cur.x, cur.y + cur.s), egui::CursorIcon::ResizeNeSw),
+            (r.left_bottom(), (cur.x + cur.s, cur.y), egui::CursorIcon::ResizeNeSw),
+            (r.right_bottom(), (cur.x, cur.y), egui::CursorIcon::ResizeNwSe),
+        ];
+        let corner_at = |p: egui::Pos2| if cur_drawn { corners.iter().find(|c| c.0.distance(p) < 10.0).copied() } else { None };
+        if let Some(p) = resp.hover_pos() {
+            let icon = if self.box_drag.is_some() || self.drawing {
+                egui::CursorIcon::Crosshair
+            } else if let Some(c) = corner_at(p) {
+                c.2
+            } else if cur_drawn && r.contains(p) {
+                egui::CursorIcon::Move
+            } else {
+                egui::CursorIcon::Crosshair
+            };
+            ui.ctx().set_cursor_icon(icon);
+        }
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let f = to_frac(p);
+                self.box_drag = Some(if self.drawing {
+                    BoxDrag::Draw(f)
+                } else if let Some(c) = corner_at(p) {
+                    BoxDrag::Resize(c.1)
+                } else if cur_drawn && r.contains(p) {
+                    BoxDrag::Move((f.0 - cur.x, f.1 - cur.y))
+                } else {
+                    BoxDrag::Draw(f)
+                });
+            }
+        }
+        if resp.dragged() {
+            if let (Some(d), Some(p)) = (self.box_drag, resp.interact_pointer_pos()) {
+                let f = to_frac(p);
+                let nb = match d {
+                    BoxDrag::Draw(a) | BoxDrag::Resize(a) => ZBox::from_drag(a, f),
+                    BoxDrag::Move(off) => ZBox { x: f.0 - off.0, y: f.1 - off.1, s: cur.s }.clamped(),
+                };
+                let z = &mut self.zones[i];
+                if end_box {
+                    z.b = nb;
+                    z.b_drawn = true;
+                } else {
+                    z.a = nb;
+                    z.a_drawn = true;
+                    if !z.pan {
+                        z.b = nb;
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            self.box_drag = None;
+            self.drawing = false;
+        }
+    }
+
+    /// Numbered, coloured zone bands under the timeline. Click to select,
+    /// drag an edge to change the time.
+    fn zone_bands_ui(&mut self, ui: &mut egui::Ui, x_of: &dyn Fn(f64) -> f32, t_of: &dyn Fn(f32) -> f64) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 16.0), Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, theme::CARD.gamma_multiply(0.6));
+        let enabled = self.zoom_allowed();
+        let mut spans: Vec<(usize, egui::Rect)> = Vec::new();
+        for (i, z) in self.zones.iter().enumerate() {
+            let Some((s, e)) = z.times() else { continue };
+            if e <= s {
+                continue;
+            }
+            let r = egui::Rect::from_x_y_ranges(x_of(s)..=x_of(e).max(x_of(s) + 2.0), rect.y_range());
+            let sel = self.sel_zone == Some(i);
+            let mut col = zone_color(i).gamma_multiply(if sel { 0.95 } else { 0.55 });
+            if !enabled {
+                col = col.gamma_multiply(0.4);
+            }
+            painter.rect_filled(r, 2.0, col);
+            if sel {
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+            }
+            if r.width() > 12.0 {
+                painter.text(r.center(), egui::Align2::CENTER_CENTER, format!("{}", i + 1), egui::FontId::proportional(11.0), Color32::BLACK);
+            }
+            spans.push((i, r));
+        }
+        if !enabled {
+            return;
+        }
+        let edge_at = |p: egui::Pos2| -> Option<(usize, bool)> {
+            spans.iter().find_map(|&(i, r)| {
+                if (p.x - r.left()).abs() < 5.0 {
+                    Some((i, true))
+                } else if (p.x - r.right()).abs() < 5.0 {
+                    Some((i, false))
+                } else {
+                    None
+                }
+            })
+        };
+        let zone_at = |p: egui::Pos2| spans.iter().find(|s| s.1.contains(p)).map(|s| s.0);
+        if let Some(p) = resp.hover_pos() {
+            if edge_at(p).is_some() || self.band_drag.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            } else if zone_at(p).is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if let Some(i) = zone_at(p) {
+                if let Some((s, e)) = self.zones[i].times() {
+                    resp.clone().on_hover_text(format!("Zone {}: {} - {}", i + 1, timecode::format_short(s), timecode::format_short(e)));
+                }
+            }
+        }
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.band_drag = edge_at(p);
+                if let Some((i, _)) = self.band_drag {
+                    self.sel_zone = Some(i);
+                    self.edit_end_box = false;
+                    self.drawing = false;
+                }
+            }
+        }
+        if resp.dragged() {
+            if let (Some((i, is_start)), Some(p)) = (self.band_drag, resp.interact_pointer_pos()) {
+                let t = t_of(p.x);
+                let z = &mut self.zones[i];
+                if is_start {
+                    z.start_text = timecode::format_compact(t);
+                } else {
+                    z.end_text = timecode::format_compact(t);
+                }
+                self.seek(t);
+            }
+        }
+        if resp.drag_stopped() {
+            self.band_drag = None;
+        }
+        if resp.clicked() {
+            if let Some(i) = resp.interact_pointer_pos().and_then(zone_at) {
+                self.select_zone(i);
+            }
+        }
     }
 
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
@@ -679,6 +1191,17 @@ impl Editor {
             }
         }
         if self.media.is_some() {
+            if let (true, Some(g)) = (self.settings.show_ghost && !exported_view, self.ghost) {
+                // Thin, faint "you started here" line with a small notch on top.
+                let gx = x_of(g);
+                let col = Color32::from_white_alpha(110);
+                painter.line_segment([egui::pos2(gx, rect.top()), egui::pos2(gx, rect.bottom())], Stroke::new(1.0, col));
+                painter.add(egui::Shape::convex_polygon(
+                    vec![egui::pos2(gx - 4.0, rect.top()), egui::pos2(gx + 4.0, rect.top()), egui::pos2(gx, rect.top() + 5.0)],
+                    col,
+                    Stroke::NONE,
+                ));
+            }
             let px = x_of(pos);
             painter.line_segment([egui::pos2(px, rect.top() - 2.0), egui::pos2(px, rect.bottom() + 2.0)], Stroke::new(2.0, Color32::WHITE));
         }
@@ -734,6 +1257,13 @@ impl Editor {
                 }
             }
         }
+        if self.show_bands() && !exported_view {
+            ui.add_space(3.0);
+            let (left, width) = (rect.left(), rect.width());
+            let x_of = move |t: f64| left + (t / duration).clamp(0.0, 1.0) as f32 * width;
+            let t_of = move |x: f32| (((x - left) / width).clamp(0.0, 1.0) as f64) * duration;
+            self.zone_bands_ui(ui, &x_of, &t_of);
+        }
         let click_hint = |a: Action| self.settings.keybinds.get(a).map(|b| b.display());
         let hint = match (click_hint(Action::TimelineStart), click_hint(Action::TimelineEnd)) {
             (Some(s), Some(e)) => format!("{s}: set start  ·  {e}: set end"),
@@ -778,7 +1308,49 @@ impl Editor {
                     if ui.button("Set end").on_hover_text(self.binding_hint(Action::SetEnd)).clicked() {
                         self.handle_action(Action::SetEnd, &ctx);
                     }
+                    ui.add_space(10.0);
+                    let ghost = self.ghost.filter(|_| self.settings.show_ghost);
+                    let go_tip = match ghost {
+                        Some(g) => format!("Move the playhead to the ghost line ({})", timecode::format_short(g)),
+                        None => "Move the playhead to the ghost line. It appears where you start playing.".into(),
+                    };
+                    if ui.add_enabled(ghost.is_some(), egui::Button::new("Go to ghost")).on_hover_text(&go_tip).on_disabled_hover_text(&go_tip).clicked() {
+                        if let Some(g) = ghost {
+                            self.seek(g);
+                            self.paused_pos = g;
+                        }
+                    }
+                    let play_tip = match ghost {
+                        Some(g) => format!("Jump back to the ghost line ({}) and play from there", timecode::format_short(g)),
+                        None => "Play from the ghost line. It appears where you start playing.".into(),
+                    };
+                    if ui.add_enabled(ghost.is_some(), egui::Button::new("Play at ghost")).on_hover_text(&play_tip).on_disabled_hover_text(&play_tip).clicked() {
+                        if let Some(g) = ghost {
+                            self.seek(g);
+                            // Starting from the ghost keeps the ghost where it is.
+                            self.paused_pos = g;
+                            if let Some(v) = &self.video {
+                                v.player.set_property("pause", "no");
+                            }
+                        }
+                    }
+                    let tip = match ghost {
+                        Some(g) => format!("Set the start to the ghost line ({}), where you last pressed play", timecode::format_short(g)),
+                        None => "Set the start to the ghost line. It appears where you start playing.".into(),
+                    };
+                    if ui.add_enabled(ghost.is_some(), egui::Button::new("Start at ghost")).on_hover_text(&tip).on_disabled_hover_text(&tip).clicked() {
+                        if let Some(g) = ghost {
+                            self.start_text = timecode::format_compact(g);
+                        }
+                    }
                 });
+                if ui
+                    .selectable_label(self.settings.show_ghost, "Ghost")
+                    .on_hover_text("Show a faint line on the timeline where you last started playing")
+                    .clicked()
+                {
+                    self.settings.show_ghost = !self.settings.show_ghost;
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if has {
@@ -805,6 +1377,13 @@ impl Editor {
             if ui.small_button(all).clicked() {
                 self.show_keys = true;
             }
+            // Preview-only listening volume, at the right of this row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().slider_width = 100.0;
+                let hint = "How loud the preview plays. Only changes what you hear here. Your clip's volume is set in Audio and video.";
+                ui.add(egui::Slider::new(&mut self.settings.preview_volume, 0..=100).show_value(false)).on_hover_text(hint);
+                ui.label(RichText::new(format!("Listen {}%", self.settings.preview_volume)).small().color(theme::MUTED)).on_hover_text(hint);
+            });
         });
     }
 
@@ -840,7 +1419,7 @@ impl Editor {
         // 2. Name
         theme::section(ui, "Output name");
         let auto = match (&media, self.trim()) {
-            (Some(m), Some((s, e))) => job::auto_name(&m.path, s, e, self.effective_opts().effective_speed()),
+            (Some(m), Some((s, e))) => job::auto_name(&m.path, s, e, self.effective_opts().effective_speed(), self.zoom_in_name()),
             _ => "automatic name".into(),
         };
         ui.add(egui::TextEdit::singleline(&mut self.name_text).hint_text(auto).desired_width(f32::INFINITY));
@@ -872,6 +1451,10 @@ impl Editor {
             let len = job::output_duration(s, e, self.effective_opts().effective_speed());
             ui.label(format!("New clip length: {}", if len < 60.0 { format!("{len:.2} s") } else { timecode::format(len) }));
         }
+        ui.separator();
+
+        // 4. Zoom
+        self.zoom_ui(ui);
         ui.separator();
 
         // 4. Cut mode
@@ -969,7 +1552,7 @@ impl Editor {
             for pr in &problems {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&pr.message).color(theme::WARN));
-                    if let Some(fix) = pr.fix {
+                    for &fix in &pr.fixes {
                         if ui.small_button(fix.label()).clicked() {
                             self.apply_fix(fix);
                         }
@@ -1015,6 +1598,171 @@ impl Editor {
             }
         } else if self.media.is_some() && problems.is_empty() {
             theme::hint(ui, "Ready.");
+        }
+    }
+
+    fn zoom_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            theme::section(ui, "Zoom");
+            if !self.zones.is_empty() {
+                ui.label(RichText::new(format!("{} / {}", self.zones.len(), zoom::MAX_ZONES)).small().color(theme::MUTED));
+            }
+        });
+        let blocked = self.zoom_blocked_reason();
+        let pos = self.position();
+        let edit_end_box = self.edit_end_box;
+        let sel_zone = self.sel_zone;
+        let drawing_now = self.drawing;
+        let (mut select, mut select_quiet, mut delete, mut draw) = (None, None, None, None);
+        let (mut pick, mut unlock) = (None, None);
+        ui.add_enabled_ui(blocked.is_none(), |ui| {
+            if self.zones.is_empty() {
+                theme::hint(ui, "Zoom into part of the picture for a stretch of time. Add a zone, then draw a box on the video.");
+            }
+            for (i, z) in self.zones.iter_mut().enumerate() {
+                let col = zone_color(i);
+                let selected = sel_zone == Some(i);
+                let frame = theme::card().stroke(Stroke::new(if selected { 1.5 } else { 1.0 }, if selected { col } else { theme::BORDER }));
+                let r = frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 5.0, col);
+                        if ui.selectable_label(selected, RichText::new(format!("Zone {}", i + 1)).strong().color(col)).on_hover_text("Select and jump to its start").clicked() {
+                            select = Some(i);
+                        }
+                        ui.label(RichText::new(format!("{:.1}x", z.max_zoom())).small().color(theme::MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Delete").clicked() {
+                                delete = Some(i);
+                            }
+                        });
+                    });
+                    // Box controls: start box on the left, end box on the right.
+                    ui.columns(2, |cols| {
+                        for (c, end) in [false, true].into_iter().enumerate() {
+                            let ui = &mut cols[c];
+                            ui.label(RichText::new(if end { "End box" } else { "Start box" }).small().color(theme::MUTED));
+                            let locked = end && !z.pan;
+                            let drawn = if end { z.b_drawn } else { z.a_drawn };
+                            let this_box = selected && (edit_end_box && z.pan) == end;
+                            ui.add_enabled_ui(!locked, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    if ui
+                                        .add_enabled(!drawn, egui::Button::selectable(this_box && drawing_now, "Draw box"))
+                                        .on_hover_text("Drag on the video to draw this box")
+                                        .on_disabled_hover_text(if locked { "No box change is on" } else { "Already drawn. Use Redraw to start again." })
+                                        .clicked()
+                                    {
+                                        draw = Some((i, end));
+                                    }
+                                    if ui
+                                        .add_enabled(drawn, egui::Button::selectable(this_box && !drawing_now, "Select box"))
+                                        .on_hover_text("Show this box on the video to move or resize it")
+                                        .clicked()
+                                    {
+                                        pick = Some((i, end));
+                                    }
+                                    if ui.add_enabled(drawn, egui::Button::new("Redraw")).on_hover_text("Throw this box away and draw a new one").clicked() {
+                                        draw = Some((i, end));
+                                    }
+                                });
+                            });
+                        }
+                    });
+                    ui.columns(2, |cols| {
+                        for (c, (label, text)) in [("Start", &mut z.start_text), ("End", &mut z.end_text)].into_iter().enumerate() {
+                            let ui = &mut cols[c];
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(label).small().color(theme::MUTED));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("Use playhead").clicked() {
+                                        *text = timecode::format_compact(pos);
+                                    }
+                                });
+                            });
+                            ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY));
+                            time_feedback(ui, text);
+                        }
+                    });
+                    // Under the times: Smooth on the left, No box change on the right.
+                    ui.columns(2, |cols| {
+                        cols[0].horizontal(|ui| {
+                            ui.checkbox(&mut z.smooth, "Smooth").on_hover_text("Glide in and out of the zoom. Off: cut straight in and out.");
+                            if z.smooth {
+                                ui.add(egui::DragValue::new(&mut z.glide).range(0.1..=2.0).speed(0.01).max_decimals(2).suffix(" s glide"));
+                            }
+                        });
+                        if cols[1]
+                            .selectable_label(!z.pan, "No box change")
+                            .on_hover_text("On: the zoom stays on the start box for the whole zone. Off: it pans from the start box to an end box.")
+                            .clicked()
+                        {
+                            if z.pan {
+                                z.pan = false;
+                            } else {
+                                unlock = Some(i);
+                            }
+                        }
+                    });
+                    if z.max_zoom() > zoom::WARN_ZOOM + 1e-6 {
+                        theme::warn(ui, "Over 3x zoom: the picture will look soft.");
+                    }
+                });
+                if !selected && r.response.contains_pointer() && ui.input(|i| i.pointer.primary_pressed()) {
+                    select_quiet = Some(i);
+                }
+            }
+            let full = self.zones.len() >= zoom::MAX_ZONES;
+            let label = match self.settings.keybinds.get(Action::NewZone) {
+                Some(b) => format!("+ New zone   ({})", b.display()),
+                None => "+ New zone".into(),
+            };
+            ui.add_enabled(!full, egui::Button::new(label).min_size(egui::vec2(ui.available_width(), 26.0)))
+                .on_disabled_hover_text("You can have up to 20 zones. Delete one to add another.")
+                .clicked()
+                .then(|| draw = Some((usize::MAX, false)));
+            if !self.zones.is_empty() {
+                ui.checkbox(&mut self.settings.zoom_static_preview, "Static zoom preview")
+                    .on_hover_text("Result shows box outlines instead of zooming live.");
+                theme::hint(
+                    ui,
+                    if self.settings.zoom_static_preview {
+                        "Result shows where each zoom lands as an outline. The export still zooms."
+                    } else {
+                        "Result shows the zoom live. If playback stutters, tick Static zoom preview. The export is not affected."
+                    },
+                );
+            }
+        });
+        if let Some(why) = blocked {
+            if self.media.is_some() {
+                theme::warn(ui, why);
+            }
+        }
+        if let Some(i) = delete {
+            self.sel_zone = Some(i);
+            self.delete_selected_zone();
+        } else if let Some((i, end_box)) = draw {
+            if i == usize::MAX {
+                self.new_zone();
+            } else {
+                self.goto_zone_box(i, end_box, true);
+            }
+        } else if let Some((i, end_box)) = pick {
+            self.goto_zone_box(i, end_box, false);
+        } else if let Some(i) = unlock {
+            // Pan from here: the end box starts undrawn, ready to draw.
+            let z = &mut self.zones[i];
+            z.pan = true;
+            z.b = z.a;
+            z.b_drawn = false;
+            self.goto_zone_box(i, true, true);
+        } else if let Some(i) = select {
+            self.select_zone(i);
+        } else if let Some(i) = select_quiet {
+            self.sel_zone = Some(i);
+            self.edit_end_box = false;
         }
     }
 

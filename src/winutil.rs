@@ -116,10 +116,26 @@ pub fn is_writable_dir(dir: &Path) -> bool {
 }
 
 /// Open Explorer with `file` selected.
+///
+/// Explorer only understands `/select,"C:\path with spaces\file.mp4"`. The
+/// normal `.arg()` would quote the whole thing as `"/select,C:\path..."`,
+/// which Explorer ignores, opening Documents instead. So the argument is
+/// passed raw. If the file is gone, its folder is opened instead.
 pub fn reveal_in_explorer(file: &Path) {
-    let mut arg = std::ffi::OsString::from("/select,");
+    if !file.exists() {
+        if let Some(dir) = file.parent() {
+            open_folder(dir);
+        }
+        return;
+    }
+    let _ = Command::new("explorer").raw_arg(select_arg(file)).spawn();
+}
+
+fn select_arg(file: &Path) -> std::ffi::OsString {
+    let mut arg = std::ffi::OsString::from("/select,\"");
     arg.push(file.as_os_str());
-    let _ = Command::new("explorer").arg(arg).spawn();
+    arg.push("\"");
+    arg
 }
 
 /// Open a folder in Explorer.
@@ -162,5 +178,14 @@ pub unsafe fn gl_proc_address(name: &std::ffi::CStr) -> *mut std::ffi::c_void {
             Some(f) => f as usize as *mut _,
             None => std::ptr::null_mut(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn select_arg_quotes_only_the_path() {
+        let arg = super::select_arg(std::path::Path::new(r"D:\My Clips\holiday clip_0-10.mp4"));
+        assert_eq!(arg, r#"/select,"D:\My Clips\holiday clip_0-10.mp4""#);
     }
 }

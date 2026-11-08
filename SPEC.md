@@ -36,17 +36,20 @@ Video preview on the left, tools on the right (see the approved mockup).
 - the player
 - a timeline with draggable start and end handles, kept in sync with the trim boxes
 - transport buttons (frame back, play, frame forward), plus Set start and Set end
+- a **ghost line**: a thin, faint line on the timeline where playback last started (set whenever the player goes from paused to playing, on the source only; cleared when another video is opened). **Go to ghost** moves the playhead there, **Start at ghost** sets the trim start there, **Play at ghost** jumps back to it and plays (the line stays put), and a **Ghost** toggle shows or hides the line (remembered).
+- a **Listen** volume slider (0–100 %, remembered), at the right of the shortcut strip, for the player only. It never changes the export; the clip's own volume is in Audio and video.
 - a shortcut strip showing the current bindings
 
 **Right side, top to bottom:**
 1. Output folder
 2. Output name
 3. Trim
-4. Cut mode
-5. Speed
-6. Audio and video
-7. Quality and codec, with a collapsible Advanced section
-8. Export button, progress bar, time remaining and Cancel
+4. Zoom
+5. Cut mode
+6. Speed
+7. Audio and video
+8. Quality and codec, with a collapsible Advanced section
+9. Export button, progress bar, time remaining and Cancel
 
 **Also:**
 - Open a file with the Open button, `Ctrl+O`, drag and drop, or "Edit with cheapedit" in Explorer.
@@ -66,6 +69,36 @@ Video preview on the left, tools on the right (see the approved mockup).
 - **"Until end of video"** checkbox.
 - **Times refer to the original video.** Trim is applied first, then speed. "New clip length" shows the final duration after the speed change.
 - Cuts are stored internally as a list of segments, so adding multiple segments later is straightforward.
+
+## 5a. Zoom zones (added in v0.3.0)
+
+Zoom into part of the picture for a stretch of time. Done entirely with FFmpeg (`crop` with time expressions, then `scale` back to the output size), so it needs re-encoding.
+
+- **Panel:** under Trim. With no zones it shows a **"+ New zone"** button and a one-line explanation. Up to **20 zones**; at 20 the button greys out with a short reason.
+- **Greyed out** in Fast cut mode and for "Audio only", with the reason, like speed.
+- **Each zone is a card**, top to bottom:
+  - the zone number, its zoom (e.g. `2.0x`) and a delete button
+  - **Start box** and **End box** columns, each with **Draw box** (until drawn), **Select box** (shows it on the video to move or resize it) and **Redraw**. Each button jumps the playhead to the zone's start or end frame.
+  - start and end times (typed like trim, with `h:mm:ss.ms` below and a "Use playhead" button)
+  - under the times, side by side: **Smooth** under Start (on by default, glide 0.5 s) and **No box change** under End. No box change is on by default. It locks the end box to the start box, so there's no pan, and greys out the end box's buttons. Turning it off starts drawing the end box.
+  - Clicking the zone number selects the zone and jumps to its start.
+- **Times refer to the original video**, like trim. Speed is applied after the zoom.
+- **Drawing:** "+ New zone" pauses and you draw the box on the Original view. Boxes are locked to the video's aspect ratio. Drag the middle to move, the corners to resize. The selected box is highlighted; other zones show faintly while the playhead is inside their time.
+- **Pan:** with No box change off, the zone pans from its Start box to its End box (they may differ in size). The move is eased (slow-fast-slow).
+- **Smooth:** the glide happens **inside** the zone: full frame at the zone start, fully zoomed one glide later, zooming out one glide before the end, full frame at the end. With Pan on, the pan runs between the two glides. With Smooth off the zoom cuts in and out, and the pan spans the whole zone.
+- **Touching zones:** when the gap between two smooth zones is no longer than the glide, the view glides straight from the first zone's (end) box to the next zone's (start) box instead of zooming fully out.
+- **Timeline:** each zone is a numbered, coloured band under the timeline, matching its box and card. Clicking a band selects it; dragging its edges changes its times. Ctrl/Shift+Click still only set the trim.
+- **Limits:** a warning above 3× enlargement; a box can't be smaller than 1/10 of the frame.
+- **Checks that block Export:**
+  - a zone's box hasn't been drawn yet; a panning zone's end box hasn't been drawn (offers "No box change")
+  - zones overlap (offers a fix)
+  - a zone isn't inside the trim, e.g. after the trim was changed (offers "Shrink zone to fit" and "Delete zone")
+  - a smooth zone is shorter than two glides; a zone with Smooth off is shorter than 0.1 s
+- **Output:** the zoom never changes the output resolution. HDR is converted to SDR before the crop. The automatic name gets a `_zoom` tag.
+- **Export filter:** `fps=<source fps>` (constant frame rate, so frames map 1:1) then `zoompan` with `d=1`, its `z`/`x`/`y` built as piecewise `if(lt(it,…))` expressions with smoothstep easing. (Tested: `crop` can't do this, because it fixes its size at start-up.)
+- **Preview:** Result's live preview drives mpv's `video-zoom` / `video-pan-x/y` from the same segments the FFmpeg expressions are built from (unit-tested to agree). zoompan can't run inside mpv, because it renumbers timestamps, which breaks seeking. The letterbox bars are kept black. A note says to use static preview if playback stutters (the export is not affected). A **"Static zoom preview"** checkbox shows box outlines instead of the live zoom.
+- **Shortcuts:** `Z` new zone, `Delete` delete the selected zone (both rebindable).
+- Zones are **not saved** between sessions and are cleared when another video is opened.
 
 ## 6. Cut modes
 
@@ -177,6 +210,8 @@ A volume slider (0–200%) appears in every mode that has audio.
 | `I` / `O` | Set start / end |
 | `Ctrl+E` | Export |
 | `Ctrl+O` | Open file |
+| `Z` | New zoom zone |
+| `Delete` | Delete selected zoom zone |
 | `Ctrl+Click` on the timeline | Set start there (drag to keep moving it) |
 | `Shift+Click` on the timeline | Set end there (drag to keep moving it) |
 

@@ -5,7 +5,7 @@ use crate::keybinds::Keybinds;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub output_dir: Option<PathBuf>,
@@ -13,6 +13,28 @@ pub struct Settings {
     pub options: Options,
     pub keybinds: Keybinds,
     pub updates: UpdatePrefs,
+    /// Result shows zoom boxes as outlines instead of zooming live.
+    pub zoom_static_preview: bool,
+    /// How loud the player is, 0-100. Only affects what you hear while
+    /// editing, never the export.
+    pub preview_volume: u32,
+    /// Show the ghost line where playback last started.
+    pub show_ghost: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            output_dir: None,
+            last_open_dir: None,
+            options: Options::default(),
+            keybinds: Keybinds::default(),
+            updates: UpdatePrefs::default(),
+            zoom_static_preview: false,
+            preview_volume: 100,
+            show_ghost: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -67,5 +89,6 @@ mod tests {
         let s: Settings = toml::from_str("output_dir = 'D:\\\\x'").unwrap();
         assert_eq!(s.options, Options::default());
         assert!(s.updates.check_on_startup, "update checks default to on");
+        assert_eq!(s.preview_volume, 100, "older settings files don't start the preview silent");
     }
 }

@@ -20,6 +20,7 @@ mod update;
 mod validate;
 mod video_view;
 mod winutil;
+mod zoom;
 
 use eframe::egui;
 use std::path::PathBuf;

@@ -18,11 +18,15 @@ pub struct VideoView {
     pub player: Player,
     target: Option<Target>,
     pub error: Option<String>,
+    /// Draw this many more frames even if mpv doesn't flag a new one.
+    /// mpv doesn't always flag the first frame of a file loaded while paused,
+    /// which left the previous video on screen.
+    pub force_frames: u8,
 }
 
 impl VideoView {
     pub fn new(api: Arc<Api>) -> Result<VideoView, String> {
-        Ok(VideoView { renderer: None, player: Player::new(api)?, target: None, error: None })
+        Ok(VideoView { renderer: None, player: Player::new(api)?, target: None, error: None, force_frames: 0 })
     }
 
     /// Paint the video filling `rect`. Must be called from `App::ui`.
@@ -76,9 +80,14 @@ impl VideoView {
             }
         }
         let t = self.target.as_ref().unwrap();
-        if renderer.wants_frame() || resized {
+        let forced = self.force_frames > 0;
+        if renderer.wants_frame() || resized || forced {
             renderer.render(t.fbo.0.get(), size[0], size[1]);
             unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
+        }
+        if forced {
+            self.force_frames -= 1;
+            ui.ctx().request_repaint();
         }
         ui.painter().image(t.id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
     }

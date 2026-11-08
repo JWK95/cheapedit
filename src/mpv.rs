@@ -56,6 +56,8 @@ const RENDER_UPDATE_FRAME: u64 = 1;
 const EVENT_NONE: c_int = 0;
 const EVENT_END_FILE: c_int = 7;
 const EVENT_FILE_LOADED: c_int = 8;
+const EVENT_VIDEO_RECONFIG: c_int = 17;
+const EVENT_PLAYBACK_RESTART: c_int = 21;
 
 type UpdateCb = unsafe extern "C" fn(*mut c_void);
 
@@ -135,6 +137,8 @@ impl Api {
 pub struct PlayerEvents {
     pub file_loaded: bool,
     pub end_file: bool,
+    /// The first frame after a load or seek is ready (or the video changed).
+    pub restarted: bool,
 }
 
 /// One mpv instance. Dropping it destroys the instance.
@@ -219,6 +223,7 @@ impl Player {
                 EVENT_NONE => break,
                 EVENT_FILE_LOADED => ev.file_loaded = true,
                 EVENT_END_FILE => ev.end_file = true,
+                EVENT_VIDEO_RECONFIG | EVENT_PLAYBACK_RESTART => ev.restarted = true,
                 _ => {}
             }
         }

@@ -222,6 +222,8 @@ pub struct Job<'a> {
     pub video_encoder: Option<&'static str>,
     /// Convert HDR to standard colour (zscale is available).
     pub can_tonemap: bool,
+    /// Zoom zones (times on the original video). Ignored in Fast mode.
+    pub zones: &'a [crate::zoom::Resolved],
 }
 
 /// Length of the exported clip in seconds.
@@ -283,6 +285,12 @@ pub fn build_args(j: &Job) -> Vec<String> {
             let mut vf: Vec<String> = Vec::new();
             if v.hdr && j.can_tonemap {
                 vf.push(TONEMAP.into());
+            }
+            // Zoom before speed, so zone times match the original video. The
+            // fps filter first makes the frame rate constant, which zoompan needs.
+            if let Some(z) = crate::zoom::zoompan(j.zones, j.start, v.width, v.height, v.fps) {
+                vf.push(format!("fps={}", n(v.fps)));
+                vf.push(z);
             }
             if speed != 1.0 {
                 vf.push(format!("setpts=PTS/{}", n(speed)));
@@ -436,7 +444,7 @@ pub fn estimate_bytes(j: &Job) -> u64 {
 }
 
 /// `holiday_clip_25-45_1.5x`, without extension.
-pub fn auto_name(input: &Path, start: f64, end: f64, speed: f64) -> String {
+pub fn auto_name(input: &Path, start: f64, end: f64, speed: f64, zoom: bool) -> String {
     let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into());
     let mut name = format!(
         "{stem}_{}-{}",
@@ -445,6 +453,9 @@ pub fn auto_name(input: &Path, start: f64, end: f64, speed: f64) -> String {
     );
     if speed != 1.0 {
         name.push_str(&format!("_{}x", n(speed)));
+    }
+    if zoom {
+        name.push_str("_zoom");
     }
     name
 }
@@ -497,7 +508,7 @@ mod tests {
     fn args(o: &Options, enc: Option<&'static str>) -> String {
         let m = media();
         let out = PathBuf::from("C:\\out\\x.mp4");
-        let j = Job { media: &m, opts: o, start: 25.0, end: 45.0, output: &out, video_encoder: enc, can_tonemap: true };
+        let j = Job { media: &m, opts: o, start: 25.0, end: 45.0, output: &out, video_encoder: enc, can_tonemap: true, zones: &[] };
         build_args(&j).join(" ")
     }
 
@@ -553,6 +564,23 @@ mod tests {
     }
 
     #[test]
+    fn zoom_before_speed() {
+        let m = media();
+        let out = PathBuf::from("out.mp4");
+        let bx = crate::zoom::ZBox::centered(0.5);
+        let zones = [crate::zoom::Resolved { start: 30.0, end: 35.0, glide: 0.5, a: bx, b: bx }];
+        let o = Options { speed: 2.0, ..Default::default() };
+        let j = Job { media: &m, opts: &o, start: 25.0, end: 45.0, output: &out, video_encoder: Some("libx264"), can_tonemap: true, zones: &zones };
+        let a = build_args(&j).join(" ");
+        let zp = a.find("fps=60,zoompan=").expect("zoompan present");
+        assert!(zp < a.find("setpts=PTS/2").unwrap());
+        assert!(a.contains("if(lt(it,5),"), "zone times are relative to the trim start: {a}");
+        let o = Options { mode: CutMode::Fast, ..Default::default() };
+        let j = Job { opts: &o, ..j };
+        assert!(!build_args(&j).join(" ").contains("zoompan"));
+    }
+
+    #[test]
     fn atempo_chains() {
         assert_eq!(atempo_chain(2.0), vec!["atempo=2"]);
         assert_eq!(atempo_chain(0.3), vec!["atempo=0.5", "atempo=0.6"]);
@@ -560,7 +588,8 @@ mod tests {
 
     #[test]
     fn names() {
-        assert_eq!(auto_name(Path::new("C:\\v\\holiday_clip.mp4"), 25.0, 45.0, 1.5), "holiday_clip_25-45_1.5x");
+        assert_eq!(auto_name(Path::new("C:\\v\\holiday_clip.mp4"), 25.0, 45.0, 1.5, false), "holiday_clip_25-45_1.5x");
+        assert_eq!(auto_name(Path::new("clip.mp4"), 25.0, 45.0, 1.0, true), "clip_25-45_zoom");
         assert_eq!(sanitize_name("  my: clip?. "), Some("my_ clip_".into()));
         assert_eq!(sanitize_name("con"), Some("con_".into()));
         assert_eq!(sanitize_name("   "), None);

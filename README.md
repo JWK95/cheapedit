@@ -3,6 +3,7 @@
 A lightweight Windows front end for FFmpeg. You can:
 
 - trim a clip between two timestamps
+- zoom into part of the picture for a stretch of time, with smooth glides and pans (up to 20 zones)
 - change its speed
 - keep, mute or remove the audio, or export the audio alone as an MP3
 - pick the format, codec and quality
