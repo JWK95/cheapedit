@@ -15,6 +15,7 @@ use crate::timecode;
 use crate::validate::{self, Fix};
 use crate::video_view::VideoView;
 use crate::winutil;
+use crate::speed::{self, SpeedZone, TimeMap};
 use crate::zoom::{self, ZBox, Zone};
 use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use crate::tracks::{self, TrackMix};
 use crate::waveform;
+
+mod klipy_ui;
+mod montage_ui;
+mod track_ui;
+mod overlay_ui;
+use overlay_ui::OvDrag;
 
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "mov", "webm", "avi", "m4v", "wmv", "flv", "ts", "mts", "m2ts", "mpg", "mpeg", "3gp", "ogv", "mp3", "wav", "m4a", "flac", "aac", "ogg", "opus",
@@ -39,7 +46,6 @@ struct PreviewState {
     file: Option<PathBuf>,
     exported: bool,
     range: Option<(f64, f64)>,
-    speed: f64,
     pitch_correct: bool,
     volume: u32,
     /// Preview-only listening volume (not part of the export).
@@ -60,6 +66,8 @@ struct ExportSig {
     until_end: bool,
     opts: Options,
     zones: Vec<Zone>,
+    speed_zones: Vec<SpeedZone>,
+    overlays: Vec<crate::overlay::Overlay>,
     audio: tracks::ExportAudio,
 }
 
@@ -94,6 +102,56 @@ fn fit_rect(rect: egui::Rect, w: f32, h: f32) -> egui::Rect {
     }
     let scale = (rect.width() / w).min(rect.height() / h);
     egui::Rect::from_center_size(rect.center(), egui::vec2(w * scale, h * scale))
+}
+
+/// The timeline's horizontal axis. Times are original-video seconds; on
+/// screen they're spaced by finished-video time, so a slow zone is wider and
+/// a fast one narrower. For an exported file the map is plain.
+struct Axis {
+    left: f32,
+    width: f32,
+    map: TimeMap,
+    duration: f64,
+    /// Finished length of the whole source.
+    total: f64,
+}
+
+impl Axis {
+    fn new(xs: egui::Rangef, map: TimeMap, duration: f64) -> Axis {
+        let total = map.to_out(duration).max(0.001);
+        Axis { left: xs.min, width: xs.span(), map, duration, total }
+    }
+    fn x_of(&self, t: f64) -> f32 {
+        self.left + (self.map.to_out(t.clamp(0.0, self.duration)) / self.total).clamp(0.0, 1.0) as f32 * self.width
+    }
+    fn t_of(&self, x: f32) -> f64 {
+        self.t_at(((x - self.left) / self.width).clamp(0.0, 1.0) as f64)
+    }
+    /// The original time a fraction (0-1) of the way along.
+    fn t_at(&self, f: f64) -> f64 {
+        self.map.to_src(f * self.total).clamp(0.0, self.duration)
+    }
+}
+
+/// Speed band colours: blue for slow, orange for fast, grey for 1x.
+fn speed_color(speed: f64) -> Color32 {
+    if speed < 1.0 {
+        Color32::from_rgb(0x5e, 0xa8, 0xf0)
+    } else if speed > 1.0 {
+        Color32::from_rgb(0xf0, 0x9a, 0x4e)
+    } else {
+        Color32::from_rgb(0x9a, 0x9a, 0xa8)
+    }
+}
+
+/// "= 0:14.2 in final video" for a typed original time, when speed zones
+/// change where it lands. `s0` is the trim start.
+fn final_text(map: &TimeMap, s0: f64, text: &str) -> Option<String> {
+    if map.is_identity() {
+        return None;
+    }
+    let t = timecode::parse(text).ok()?;
+    Some(format!("= {} in final video", timecode::format_short((map.to_out(t) - map.to_out(s0)).max(0.0))))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -190,6 +248,57 @@ pub struct Editor {
     egui_ctx: egui::Context,
     /// A Discord export that's still over its cap after the retry.
     over_cap: Option<String>,
+    speed_zones: Vec<SpeedZone>,
+    sel_speed: Option<usize>,
+    /// Dragging a speed band's edge on the timeline: (zone, is start).
+    speed_band_drag: Option<(usize, bool)>,
+    /// The time map the timeline is drawn with. Only updated while no mouse
+    /// button is down, so the timeline re-flows when a drag ends instead of
+    /// moving under the cursor.
+    shown_map: TimeMap,
+    /// The speed and zone mute last given to mpv for the live preview.
+    live_speed: (f64, bool),
+    overlays: Vec<crate::overlay::Overlay>,
+    sel_overlay: Option<usize>,
+    /// Editing the selected overlay's end position rather than its start.
+    edit_end_pos: bool,
+    ov_drag: Option<OvDrag>,
+    /// Dragging an overlay band's edge: (overlay, is start).
+    ov_band_drag: Option<(usize, bool)>,
+    previews: crate::previews::Previews,
+    /// Installed fonts, read the first time a text overlay needs them.
+    fonts: Option<Vec<crate::fonts::Font>>,
+    /// Font files already given to egui for text previews (and ones that failed).
+    egui_fonts: std::collections::HashSet<String>,
+    bad_fonts: std::collections::HashSet<String>,
+    /// The Assets folder's files, and when/for which folder they were listed.
+    assets: Vec<PathBuf>,
+    assets_for: Option<PathBuf>,
+    assets_scanned: Instant,
+    show_klipy: bool,
+    show_features: bool,
+    klipy_key_visible: bool,
+    klipy: klipy_ui::KlipyUi,
+    /// Montage mode is on (the strip shows, Finish montage replaces Export).
+    montage_on: bool,
+    montage: Option<montage_ui::MontageState>,
+    montage_name_text: String,
+    montage_note: Option<String>,
+    /// A montage card being dragged to a new place.
+    montage_drag: Option<usize>,
+    /// The running montage export's sources (ticked when it's done) and work folder.
+    montage_sources: Vec<PathBuf>,
+    montage_temp: Option<PathBuf>,
+    track_job: Option<track_ui::TrackJob>,
+    /// What the last tracking run did (or why it failed).
+    track_note: Option<String>,
+    /// Which device the last run used, for Features.
+    tracker_last: Option<String>,
+    /// Fixing a tracked zone: its index, and the box being dragged.
+    fix_zone: Option<usize>,
+    fix_box: Option<ZBox>,
+    /// Where the fix box was grabbed (offset from its corner).
+    fix_grab: Option<(f64, f64)>,
 }
 
 impl Editor {
@@ -269,6 +378,40 @@ impl Editor {
             lanes_h: 0.0,
             egui_ctx: ctx.clone(),
             over_cap: None,
+            speed_zones: Vec::new(),
+            sel_speed: None,
+            speed_band_drag: None,
+            shown_map: TimeMap::default(),
+            live_speed: (1.0, false),
+            overlays: Vec::new(),
+            sel_overlay: None,
+            edit_end_pos: false,
+            ov_drag: None,
+            ov_band_drag: None,
+            previews: crate::previews::Previews::default(),
+            fonts: None,
+            egui_fonts: Default::default(),
+            bad_fonts: Default::default(),
+            assets: Vec::new(),
+            assets_for: None,
+            assets_scanned: Instant::now() - Duration::from_secs(60),
+            show_klipy: false,
+            show_features: false,
+            klipy_key_visible: false,
+            klipy: Default::default(),
+            montage_on: false,
+            montage: None,
+            montage_name_text: String::new(),
+            montage_note: None,
+            montage_drag: None,
+            montage_sources: Vec::new(),
+            montage_temp: None,
+            track_job: None,
+            track_note: None,
+            tracker_last: None,
+            fix_zone: None,
+            fix_box: None,
+            fix_grab: None,
         }
     }
 
@@ -333,7 +476,30 @@ impl Editor {
         let (s, e) = self.trim()?;
         let o = &self.settings.options;
         let has_audio = m.audio.is_some() && !matches!(o.av, AvMode::RemoveAudio | AvMode::Mute);
-        Some(discord::plan(cap, job::output_duration(s, e, o.speed), v.width, v.height, v.fps, has_audio))
+        Some(discord::plan(cap, job::output_duration(s, e, &self.active_speeds()), v.width, v.height, v.fps, has_audio))
+    }
+
+    /// Why the speed tools are greyed out, if they are.
+    fn speed_blocked_reason(&self) -> Option<&'static str> {
+        match &self.media {
+            None => Some("Open a video first."),
+            _ if self.effective_opts().mode == CutMode::Fast => Some("Switch to Precise to change speed. Fast mode copies the clip untouched."),
+            _ => None,
+        }
+    }
+
+    /// Speed zones used by the export and preview (empty when speed doesn't apply).
+    fn active_speeds(&self) -> Vec<speed::Resolved> {
+        if self.speed_blocked_reason().is_some() {
+            return Vec::new();
+        }
+        let trim = self.trim();
+        self.speed_zones.iter().filter_map(|z| z.resolve(trim)).collect()
+    }
+
+    /// Original time <-> finished time, from the current speed zones.
+    fn time_map(&self) -> TimeMap {
+        TimeMap::new(&self.active_speeds())
     }
 
     /// Zoom works when the export re-encodes a picture.
@@ -397,6 +563,8 @@ impl Editor {
             until_end: self.until_end,
             opts: self.effective_opts(),
             zones: self.zones.clone(),
+            speed_zones: self.speed_zones.clone(),
+            overlays: self.overlays.clone(),
             audio: tracks::export_audio(&self.tracks),
         })
     }
@@ -427,7 +595,8 @@ impl Editor {
         let space = match (&self.media, self.trim(), self.dir_status.2) {
             (Some(m), Some((s, e)), Some(free)) => {
                 let out = PathBuf::new();
-                let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[], tracks: &self.tracks };
+                let speeds = self.active_speeds();
+                let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[], tracks: &self.tracks, speed_zones: &speeds, overlays: &[], montage: None };
                 Some((job::estimate_bytes(&j), free))
             }
             _ => None,
@@ -443,10 +612,14 @@ impl Editor {
             space,
             dir_writable: self.dir_status.1,
             zones: &self.zones,
+            speed_zones: &self.speed_zones,
+            overlays: if self.overlays_blocked_reason().is_some() { &[] } else { &self.overlays },
         });
         if let Some(Err(max_out)) = self.discord_plan() {
-            // The trim is in original-video time, so scale by the speed.
-            let max_trim = max_out * self.settings.options.speed;
+            // The trim is in original-video time, so go back through the speed zones.
+            let map = self.time_map();
+            let s = self.trim().map_or(0.0, |t| t.0);
+            let max_trim = map.to_src(map.to_out(s) + max_out) - s;
             out.push(validate::Problem {
                 message: format!(
                     "Too long for {} ({} MB) even at 480p. Trim it to under {}.",
@@ -497,8 +670,14 @@ impl Editor {
                 self.open_error = None;
                 self.applied = None;
                 self.loaded = None;
+                self.cancel_track();
+                self.fix_zone = None;
                 self.zones.clear();
                 self.sel_zone = None;
+                self.speed_zones.clear();
+                self.sel_speed = None;
+                self.overlays.clear();
+                self.sel_overlay = None;
                 self.drawing = false;
                 self.ghost = None;
                 self.was_paused = true;
@@ -541,6 +720,20 @@ impl Editor {
                     self.drawing = false;
                 }
             }
+            Fix::Overlay(z) => {
+                let trim = self.trim();
+                z.apply(&mut self.overlays, trim);
+                if self.sel_overlay.is_some_and(|i| i >= self.overlays.len()) || matches!(z, crate::overlay::OverlayFix::Delete(_)) {
+                    self.sel_overlay = None;
+                }
+            }
+            Fix::Speed(z) => {
+                let trim = self.trim();
+                z.apply(&mut self.speed_zones, trim);
+                if self.sel_speed.is_some_and(|i| i >= self.speed_zones.len()) || matches!(z, speed::SpeedFix::Delete(_)) {
+                    self.sel_speed = None;
+                }
+            }
         }
     }
 
@@ -571,12 +764,28 @@ impl Editor {
         let encodes_video = o.mode == CutMode::Precise && o.av != AvMode::AudioOnly && m.video.is_some();
         let enc = if encodes_video { caps.pick(o.vcodec, o.use_gpu) } else { None };
         let zones = self.active_zones();
-        let j = Job { media: &m, opts: &o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &zones, tracks: &self.tracks };
+        let speeds = self.active_speeds();
+        let overlays = match self.overlays_for_export() {
+            Ok(o) => o,
+            Err(e) => {
+                self.log.error(&e);
+                self.last_outcome = Some((Outcome::Failed(e), out));
+                return;
+            }
+        };
+        if !overlays.is_empty() {
+            self.log.info(format!("{} overlay(s)", overlays.len()));
+        }
+        let j = Job { media: &m, opts: &o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &zones, tracks: &self.tracks, speed_zones: &speeds, overlays: &overlays, montage: None };
         if !zones.is_empty() {
             self.log.info(format!("Zooming {} zone(s)", zones.len()));
         }
+        if !speeds.is_empty() {
+            let list: Vec<String> = speeds.iter().map(|z| format!("{}-{} at {}x", timecode::format_short(z.start), timecode::format_short(z.end), z.speed)).collect();
+            self.log.info(format!("Speed zones: {}", list.join(", ")));
+        }
         let args = job::build_args(&j);
-        let total = job::output_duration(start, end, o.effective_speed());
+        let total = job::output_duration(start, end, &speeds);
         if let Some(e) = enc {
             self.log.info(format!("Encoding video with {e}"));
         }
@@ -623,7 +832,12 @@ impl Editor {
             }
             self.exported_file = Some(path.clone());
             self.view = View::Result;
-            if let Some(m) = &self.media {
+            if !self.montage_sources.is_empty() {
+                for s in &self.montage_sources {
+                    self.history.record(s, winutil::now_stamp());
+                }
+                self.history.save();
+            } else if let Some(m) = &self.media {
                 self.history.record(&m.path, winutil::now_stamp());
                 self.history.save();
             }
@@ -631,6 +845,11 @@ impl Editor {
             self.rescan_lists(ctx);
         }
         self.export_cap = None;
+        self.montage_sources.clear();
+        if let Some(t) = self.montage_temp.take() {
+            // Its files are already deleted; the folder goes if it's empty.
+            let _ = std::fs::remove_dir(t);
+        }
         self.last_outcome = Some((outcome, path));
     }
 
@@ -651,11 +870,23 @@ impl Editor {
                 self.until_end = false;
             }
             Action::ToggleView if has_media => self.view = if self.view == View::Original { View::Result } else { View::Original },
-            Action::Export => self.start_export(ctx),
+            Action::Export if !self.montage_on => self.start_export(ctx),
             Action::OpenFile => self.open_dialog(),
             Action::ShowShortcuts => self.show_keys = true,
             Action::NewZone => self.new_zone(),
-            Action::DeleteZone => self.delete_selected_zone(),
+            Action::NewSpeedZone => self.new_speed_zone(),
+            Action::NewTextOverlay => self.new_text_overlay(),
+            Action::OpenKlipy => self.open_klipy(),
+            Action::AddToMontage => self.add_to_montage(),
+            Action::DeleteZone => {
+                if self.sel_overlay.is_some() {
+                    self.delete_selected_overlay();
+                } else if self.sel_speed.is_some() {
+                    self.delete_selected_speed();
+                } else {
+                    self.delete_selected_zone();
+                }
+            }
             _ => {}
         }
     }
@@ -738,7 +969,53 @@ impl Editor {
         self.seek(s);
     }
 
+    /// Add a speed zone at the playhead (inside the trim, after any speed
+    /// zone already there).
+    fn new_speed_zone(&mut self) {
+        if self.speed_blocked_reason().is_some() || self.speed_zones.len() >= speed::MAX_ZONES {
+            return;
+        }
+        let Some((ts, te)) = self.trim() else { return };
+        let trim = Some((ts, te));
+        let mut times: Vec<(f64, f64)> = self.speed_zones.iter().filter_map(|z| z.times(trim)).collect();
+        times.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut s = self.position().clamp(ts, te);
+        for &(zs, ze) in &times {
+            if s >= zs && s < ze {
+                s = ze;
+            }
+        }
+        let mut e = (s + 3.0).min(te);
+        if let Some(&(next, _)) = times.iter().find(|t| t.0 > s) {
+            e = e.min(next);
+        }
+        if e - s < 1.0 {
+            s = (e - 1.0).max(ts);
+        }
+        self.speed_zones.push(SpeedZone::new(s, e));
+        self.select_speed(self.speed_zones.len() - 1);
+    }
+
+    fn select_speed(&mut self, i: usize) {
+        self.sel_speed = Some(i);
+        self.sel_zone = None;
+        self.sel_overlay = None;
+        self.drawing = false;
+    }
+
+    fn delete_selected_speed(&mut self) {
+        if let Some(i) = self.sel_speed.take() {
+            if i < self.speed_zones.len() {
+                self.speed_zones.remove(i);
+            }
+        }
+    }
+
     fn delete_selected_zone(&mut self) {
+        if self.sel_zone.is_some() {
+            self.cancel_track();
+            self.fix_zone = None;
+        }
         if let Some(i) = self.sel_zone.take() {
             if i < self.zones.len() {
                 self.zones.remove(i);
@@ -751,6 +1028,8 @@ impl Editor {
     /// Select a zone and jump to its start.
     fn select_zone(&mut self, i: usize) {
         self.sel_zone = Some(i);
+        self.sel_speed = None;
+        self.sel_overlay = None;
         self.edit_end_box = false;
         self.drawing = false;
         if let Some((s, _)) = self.zones.get(i).and_then(|z| z.times()) {
@@ -803,7 +1082,6 @@ impl Editor {
             file,
             exported,
             range: None,
-            speed: 1.0,
             pitch_correct: true,
             volume: 100,
             listen: self.settings.preview_volume,
@@ -820,7 +1098,6 @@ impl Editor {
                     file: src,
                     exported: false,
                     range: self.trim(),
-                    speed: o.effective_speed(),
                     pitch_correct: !o.change_pitch,
                     volume: if o.mode == CutMode::Fast { 100 } else { o.volume_pct },
                     listen: self.settings.preview_volume,
@@ -864,6 +1141,21 @@ impl Editor {
             self.live_zoom = z;
         }
         let want = self.desired_preview();
+        // Speed zones: mpv's own speed (and mute for muted zones), following
+        // the playhead. Like the zoom, this changes as it plays.
+        let live = self.view == View::Result && self.exported_file.is_none();
+        let ls = if live {
+            self.time_map().zone_at(self.position()).map_or((1.0, false), |z| (z.speed, z.mute))
+        } else {
+            (1.0, false)
+        };
+        if ls != self.live_speed {
+            if let Some(v) = &self.video {
+                v.player.set_property("speed", &ls.0.to_string());
+                v.player.set_property("mute", if want.mute || ls.1 { "yes" } else { "no" });
+            }
+            self.live_speed = ls;
+        }
         if self.applied.as_ref() == Some(&want) {
             return;
         }
@@ -889,12 +1181,12 @@ impl Editor {
             }
             self.loaded = want.file.clone();
         }
-        p.set_property("speed", &want.speed.to_string());
+        p.set_property("speed", &self.live_speed.0.to_string());
         p.set_property("audio-pitch-correction", if want.pitch_correct { "yes" } else { "no" });
         // The listening volume scales whatever the export would sound like.
         let heard = want.volume as u64 * self.settings.preview_volume as u64 / 100;
         p.set_property("volume", &heard.to_string());
-        p.set_property("mute", if want.mute { "yes" } else { "no" });
+        p.set_property("mute", if want.mute || self.live_speed.1 { "yes" } else { "no" });
         p.set_property("vid", if want.no_video { "no" } else { "auto" });
         match want.range {
             Some((a, b)) => {
@@ -961,6 +1253,9 @@ impl Editor {
             }
         }
         self.finish_export(&ctx);
+        self.poll_klipy();
+        self.poll_track();
+        self.sync_montage();
         if self.library.poll(&ctx) {
             self.catch_up_history();
         }
@@ -994,6 +1289,13 @@ impl Editor {
                 if ui.button("Open video").on_hover_text(self.binding_hint(Action::OpenFile)).clicked() {
                     self.open_dialog();
                 }
+                if ui
+                    .selectable_label(self.montage_on, " Montage ")
+                    .on_hover_text("Edit several clips one after another and join them into one file")
+                    .clicked()
+                {
+                    self.montage_on = !self.montage_on;
+                }
                 if let Some(m) = &self.media {
                     ui.label(RichText::new(m.path.file_name().unwrap_or_default().to_string_lossy()).strong());
                 }
@@ -1006,6 +1308,9 @@ impl Editor {
                     }
                     if ui.button("Keybindings").clicked() {
                         self.show_keys = true;
+                    }
+                    if ui.button("Features").on_hover_text("KLIPY GIF search and other extras").clicked() {
+                        self.show_features = true;
                     }
                     let log_label = if self.show_log { "Hide log" } else { "Log" };
                     if ui.button(log_label).clicked() {
@@ -1044,6 +1349,15 @@ impl Editor {
 
         if self.show_log {
             self.log_window(&ctx);
+        }
+        if self.show_features {
+            self.features_window(&ctx);
+        }
+        if self.montage_on && self.montage.is_none() {
+            self.montage_picker(&ctx);
+        }
+        if self.show_klipy {
+            self.klipy_window(&ctx);
         }
         if self.show_keys {
             let mut open = true;
@@ -1095,12 +1409,13 @@ impl Editor {
             });
         });
         if self.view == View::Result && has_media && self.exported_file.is_none() {
-            theme::hint(ui, "Live preview shows your trim, speed, audio and zoom choices. Quality and format changes only show in the exported file.");
+            theme::hint(ui, "Live preview shows your trim, speed, audio, zoom and overlays. Quality and format changes only show in the exported file.");
         }
         ui.add_space(4.0);
 
         // Leave room below the video for the timeline, controls and shortcut strip.
-        let below = if self.show_bands() { 182.0 } else { 160.0 } + self.lanes_h;
+        let rows = self.show_bands() as u8 + self.show_speed_bands() as u8 + self.show_overlay_bands() as u8;
+        let below = 160.0 + rows as f32 * 22.0 + self.lanes_h + self.montage_strip_height();
         let avail = ui.available_size();
         let video_h = (avail.y - below).max(120.0);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail.x, video_h), Sense::click_and_drag());
@@ -1130,17 +1445,24 @@ impl Editor {
         } else if let Some(e) = &self.open_error {
             ui.painter().text(rect.center_top() + egui::vec2(0.0, 20.0), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(14.0), theme::DANGER);
         }
+        let mut on_overlay = false;
         if let Some((w, h)) = self.media.as_ref().and_then(|m| m.video.as_ref()).map(|v| (v.width as f32, v.height as f32)) {
             if self.video.is_some() {
-                self.zoom_overlay(ui, &resp, rect, fit_rect(rect, w, h));
+                let vr = fit_rect(rect, w, h);
+                self.zoom_overlay(ui, &resp, rect, vr);
+                on_overlay = self.overlays_on_video(ui, &resp, rect, vr);
             }
         }
-        if resp.clicked() && has_media {
+        if resp.clicked() && has_media && !on_overlay {
             self.handle_action(Action::PlayPause, &ui.ctx().clone());
         }
 
         ui.add_space(6.0);
         self.timeline_ui(ui);
+        if self.montage_on {
+            ui.add_space(6.0);
+            self.montage_strip_ui(ui);
+        }
         ui.add_space(4.0);
         self.transport_ui(ui);
         ui.add_space(2.0);
@@ -1150,6 +1472,106 @@ impl Editor {
     /// Zone bands under the timeline: shown while editing the source.
     fn show_bands(&self) -> bool {
         !self.zones.is_empty() && !(self.view == View::Result && self.exported_file.is_some())
+    }
+
+    fn show_speed_bands(&self) -> bool {
+        !self.speed_zones.is_empty() && !(self.view == View::Result && self.exported_file.is_some())
+    }
+
+    /// Speed bands under the timeline, labelled with their speed. Click to
+    /// select, drag an edge to change the time (the timeline re-flows when
+    /// you let go).
+    fn speed_bands_ui(&mut self, ui: &mut egui::Ui, axis: &Axis) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 16.0), Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, theme::CARD.gamma_multiply(0.6));
+        let enabled = self.speed_blocked_reason().is_none();
+        let trim = self.trim();
+        let mut spans: Vec<(usize, egui::Rect, bool)> = Vec::new();
+        for (i, z) in self.speed_zones.iter().enumerate() {
+            let Some((s, e)) = z.times(trim) else { continue };
+            if e <= s {
+                continue;
+            }
+            let r = egui::Rect::from_x_y_ranges(axis.x_of(s)..=axis.x_of(e).max(axis.x_of(s) + 2.0), rect.y_range());
+            let sel = self.sel_speed == Some(i);
+            let mut col = speed_color(z.speed).gamma_multiply(if sel { 0.95 } else { 0.55 });
+            if !enabled {
+                col = col.gamma_multiply(0.4);
+            }
+            painter.rect_filled(r, 2.0, col);
+            if sel {
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+            }
+            let mut label = z.label();
+            if z.mute {
+                label.push_str(" muted");
+            }
+            if r.width() > 30.0 {
+                painter.text(r.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(11.0), Color32::BLACK);
+            }
+            spans.push((i, r, z.whole));
+        }
+        if !enabled {
+            return;
+        }
+        let edge_at = |p: egui::Pos2| -> Option<(usize, bool)> {
+            spans.iter().filter(|s| !s.2).find_map(|&(i, r, _)| {
+                if (p.x - r.left()).abs() < 5.0 {
+                    Some((i, true))
+                } else if (p.x - r.right()).abs() < 5.0 {
+                    Some((i, false))
+                } else {
+                    None
+                }
+            })
+        };
+        let zone_at = |p: egui::Pos2| spans.iter().find(|s| s.1.contains(p)).map(|s| s.0);
+        if let Some(p) = resp.hover_pos() {
+            if edge_at(p).is_some() || self.speed_band_drag.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            } else if zone_at(p).is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if let Some(i) = zone_at(p) {
+                let z = &self.speed_zones[i];
+                if let Some((s, e)) = z.times(trim) {
+                    resp.clone().on_hover_text(format!("Speed zone {}: {} - {} at {}", i + 1, timecode::format_short(s), timecode::format_short(e), z.label()));
+                }
+            }
+        }
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.speed_band_drag = edge_at(p);
+                if let Some((i, _)) = self.speed_band_drag {
+                    self.select_speed(i);
+                }
+            }
+        }
+        if resp.dragged() {
+            if let (Some((i, is_start)), Some(p)) = (self.speed_band_drag, resp.interact_pointer_pos()) {
+                let t = axis.t_of(p.x);
+                let z = &mut self.speed_zones[i];
+                if is_start {
+                    z.start_text = timecode::format_compact(t);
+                } else {
+                    z.end_text = timecode::format_compact(t);
+                }
+                self.scrub_to(t);
+            }
+        }
+        if resp.drag_stopped() {
+            self.speed_band_drag = None;
+            self.end_scrub();
+        }
+        if resp.clicked() {
+            if let Some(i) = resp.interact_pointer_pos().and_then(zone_at) {
+                self.select_speed(i);
+                if let Some((s, _)) = self.speed_zones[i].times(trim) {
+                    self.seek(s);
+                }
+            }
+        }
     }
 
     /// Zoom boxes on the video, and dragging them.
@@ -1212,6 +1634,20 @@ impl Editor {
         let Some(i) = self.sel_zone.filter(|&i| i < self.zones.len()) else { return };
         let col = zone_color(i);
         let z = self.zones[i].clone();
+        if self.fix_zone == Some(i) {
+            self.fix_on_video(ui, resp, vr, i);
+            return;
+        }
+        // A tracked zone after its first frame: show where the tracked box is.
+        let first_frame = 1.0 / self.media.as_ref().and_then(|m| m.video.as_ref()).map_or(30.0, |v| v.fps.max(1.0));
+        if z.tracked() && !self.drawing && self.box_drag.is_none() && z.times().is_some_and(|(s, e)| pos > s + first_frame && pos < e) {
+            if let Some(path) = z.resolve().and_then(|r| r.path) {
+                let r = to_screen(zoom::box_at(&path, pos));
+                painter.rect_stroke(r, 0.0, Stroke::new(2.0, col), egui::StrokeKind::Inside);
+                painter.text(r.left_top() + egui::vec2(6.0, 5.0), egui::Align2::LEFT_TOP, format!("Zone {} - tracked", i + 1), font.clone(), col);
+            }
+            return;
+        }
         let end_box = z.pan && self.edit_end_box;
         let cur = if end_box { z.b } else { z.a };
         let cur_drawn = if end_box { z.b_drawn } else { z.a_drawn };
@@ -1409,11 +1845,17 @@ impl Editor {
         }
         .max(0.001);
         let pos = self.position();
+        // Re-flow only when no mouse button is down, so nothing moves mid-drag.
+        let live_map = self.time_map();
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.shown_map = live_map.clone();
+        }
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::click_and_drag());
         let painter = ui.painter_at(rect.expand(2.0));
         painter.rect_filled(rect, 5.0, theme::CARD);
-        let x_of = |t: f64| rect.left() + (t / duration).clamp(0.0, 1.0) as f32 * rect.width();
-        let t_of = |x: f32| (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64) * duration;
+        let axis = Axis::new(rect.x_range(), if exported_view { TimeMap::default() } else { self.shown_map.clone() }, duration);
+        let x_of = |t: f64| axis.x_of(t);
+        let t_of = |x: f32| axis.t_of(x);
 
         let range = if exported_view { None } else { self.trim() };
         if let Some((s, e)) = range {
@@ -1429,7 +1871,7 @@ impl Editor {
             };
             if !heard.is_empty() {
                 let level = |t0: f64, t1: f64| heard.iter().map(|(p, g)| waveform::peak_between(p, t0, t1).unwrap_or(0.0) * g).sum::<f32>().min(1.0);
-                draw_wave(&painter, rect.shrink2(egui::vec2(0.0, 4.0)), duration, Color32::from_white_alpha(46), level);
+                draw_wave(&painter, rect.shrink2(egui::vec2(0.0, 4.0)), &|f| axis.t_at(f), Color32::from_white_alpha(46), level);
             }
         }
         if let Some((s, e)) = range {
@@ -1508,17 +1950,22 @@ impl Editor {
                 }
             }
         }
+        if self.show_speed_bands() && !exported_view {
+            ui.add_space(3.0);
+            self.speed_bands_ui(ui, &axis);
+        }
         if self.show_bands() && !exported_view {
             ui.add_space(3.0);
-            let (left, width) = (rect.left(), rect.width());
-            let x_of = move |t: f64| left + (t / duration).clamp(0.0, 1.0) as f32 * width;
-            let t_of = move |x: f32| (((x - left) / width).clamp(0.0, 1.0) as f64) * duration;
-            self.zone_bands_ui(ui, &x_of, &t_of);
+            self.zone_bands_ui(ui, &|t| axis.x_of(t), &|x| axis.t_of(x));
+        }
+        if self.show_overlay_bands() && !exported_view {
+            ui.add_space(3.0);
+            self.overlay_bands_ui(ui, &axis);
         }
         // Measured, so the video above shrinks to make room for the lanes.
         let lanes_top = ui.cursor().top();
         if self.tracks.len() > 1 && !exported_view && self.media.is_some() {
-            self.track_lanes_ui(ui, rect.x_range(), duration, range);
+            self.track_lanes_ui(ui, &axis, range);
         }
         let lanes_h = ui.cursor().top() - lanes_top;
         if (lanes_h - self.lanes_h).abs() > 0.5 {
@@ -1526,23 +1973,32 @@ impl Editor {
             ui.ctx().request_repaint();
         }
         let click_hint = |a: Action| self.settings.keybinds.get(a).map(|b| b.display());
-        let hint = match (click_hint(Action::TimelineStart), click_hint(Action::TimelineEnd)) {
+        let mut hint = match (click_hint(Action::TimelineStart), click_hint(Action::TimelineEnd)) {
             (Some(s), Some(e)) => format!("{s}: set start  ·  {e}: set end"),
             (Some(s), None) => format!("{s}: set start"),
             (None, Some(e)) => format!("{e}: set end"),
             (None, None) => String::new(),
         };
+        let mut hint_col = theme::MUTED;
+        // Mid-drag: the length the clip will have when you let go.
+        if let (false, Some((s, e))) = (exported_view, range) {
+            let (was, will) = (self.shown_map.out_len(s, e), live_map.out_len(s, e));
+            if (was - will).abs() > 0.005 {
+                hint = format!("New length {} to {}", timecode::format_short(was), timecode::format_short(will));
+                hint_col = theme::CORAL;
+            }
+        }
         ui.horizontal(|ui| {
             let mono = |t: f64| RichText::new(timecode::format_short(t)).small().monospace().color(theme::MUTED);
             let left = ui.label(mono(0.0)).rect;
             if self.media.is_some() && !hint.is_empty() {
                 // Centred under the timeline, regardless of the end-time label's width.
                 let y = left.center().y;
-                ui.painter().text(egui::pos2(rect.center().x, y), egui::Align2::CENTER_CENTER, &hint, egui::FontId::proportional(12.0), theme::MUTED);
+                ui.painter().text(egui::pos2(rect.center().x, y), egui::Align2::CENTER_CENTER, &hint, egui::FontId::proportional(12.0), hint_col);
             }
             let mut show_wave = self.settings.show_waveform;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(mono(duration));
+                ui.label(mono(axis.total));
                 if self.media.as_ref().is_some_and(|m| m.audio.is_some()) && !exported_view {
                     ui.add_space(8.0);
                     if ui
@@ -1560,12 +2016,13 @@ impl Editor {
 
     /// One lane per audio track under the timeline: its name, on/off, Solo
     /// and volume, over its own waveform. Clicking a lane's waveform seeks.
-    fn track_lanes_ui(&mut self, ui: &mut egui::Ui, xs: egui::Rangef, duration: f64, range: Option<(f64, f64)>) {
+    fn track_lanes_ui(&mut self, ui: &mut egui::Ui, axis: &Axis, range: Option<(f64, f64)>) {
         let pos = self.position();
         let names: Vec<Option<String>> = self.media.as_ref().map(|m| m.audio_tracks.iter().map(|t| t.title.clone()).collect()).unwrap_or_default();
         let soloing = self.tracks.iter().any(|t| t.solo);
-        let x_of = |t: f64| xs.min + (t / duration).clamp(0.0, 1.0) as f32 * xs.span();
-        let t_of = |x: f32| (((x - xs.min) / xs.span()).clamp(0.0, 1.0) as f64) * duration;
+        let xs = egui::Rangef::new(axis.left, axis.left + axis.width);
+        let x_of = |t: f64| axis.x_of(t);
+        let t_of = |x: f32| axis.t_of(x);
         for i in 0..self.tracks.len() {
             ui.add_space(2.0);
             let mut t = self.tracks[i];
@@ -1603,7 +2060,7 @@ impl Editor {
             let audible = if soloing { t.solo } else { t.on };
             let col = if audible { theme::ACCENT.gamma_multiply(0.9) } else { Color32::from_white_alpha(28) };
             match self.waves.track(i) {
-                Some(p) => draw_wave(&painter, rect.shrink2(egui::vec2(0.0, 2.0)), duration, col, |a, b| waveform::peak_between(&p, a, b).unwrap_or(0.0) * t.gain() as f32),
+                Some(p) => draw_wave(&painter, rect.shrink2(egui::vec2(0.0, 2.0)), &|f| axis.t_at(f), col, |a, b| waveform::peak_between(&p, a, b).unwrap_or(0.0) * t.gain() as f32),
                 None => {
                     painter.text(rect.left_center() + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, "Reading audio…", egui::FontId::proportional(11.0), theme::MUTED);
                 }
@@ -1741,6 +2198,11 @@ impl Editor {
         let media = self.media.clone();
         let busy = self.exporting();
 
+        if self.montage_on {
+            self.montage_panel_ui(ui);
+            ui.separator();
+        }
+
         // 1. Output folder
         ui.horizontal(|ui| {
             theme::section(ui, "Output folder");
@@ -1795,13 +2257,17 @@ impl Editor {
         ui.checkbox(&mut self.until_end, "Until end of video");
         theme::hint(ui, "Type 25, 1:25 or 0:01:25.500. Times are from the original video.");
         if let Some((s, e)) = self.trim() {
-            let len = job::output_duration(s, e, self.effective_opts().effective_speed());
+            let len = job::output_duration(s, e, &self.active_speeds());
             ui.label(format!("New clip length: {}", if len < 60.0 { format!("{len:.2} s") } else { timecode::format(len) }));
         }
         ui.separator();
 
         // 4. Zoom
         self.zoom_ui(ui);
+        ui.separator();
+
+        // Overlays
+        self.overlays_ui(ui);
         ui.separator();
 
         // 4. Cut mode
@@ -1829,21 +2295,8 @@ impl Editor {
         let fast = mode == CutMode::Fast;
         ui.separator();
 
-        // 5. Speed
-        theme::section(ui, "Speed");
-        ui.add_enabled_ui(!fast, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::Slider::new(&mut o.speed, 0.25..=4.0).step_by(0.25).show_value(false));
-                ui.add(egui::DragValue::new(&mut o.speed).range(0.1..=16.0).speed(0.01).max_decimals(2).suffix("×"));
-                if o.speed != 1.0 && ui.small_button("Reset").clicked() {
-                    o.speed = 1.0;
-                }
-            });
-            ui.checkbox(&mut o.change_pitch, "Change pitch with speed").on_hover_text("Off: voices sound normal at any speed. On: faster = higher, like a sped-up tape.");
-        });
-        if fast {
-            theme::warn(ui, "Switch to Precise to change this.");
-        }
+        // 5. Speed zones
+        self.speed_ui(ui);
         ui.separator();
 
         // 6. Audio and video
@@ -1926,11 +2379,15 @@ impl Editor {
         }
         ui.separator();
 
-        // 8. Estimate, then Export
-        self.estimate_ui(ui);
-        ui.add_space(4.0);
-        let problems = self.problems();
-        if self.media.is_some() {
+        // 8. Estimate, then Export (or Finish montage)
+        let problems = if self.montage_on { Vec::new() } else { self.problems() };
+        if self.montage_on {
+            self.montage_finish_ui(ui, ctx);
+        } else {
+            self.estimate_ui(ui);
+            ui.add_space(4.0);
+        }
+        if self.media.is_some() && !self.montage_on {
             for pr in &problems {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&pr.message).color(theme::WARN));
@@ -1947,7 +2404,7 @@ impl Editor {
             Some(b) => format!("Export clip   ({})", b.display()),
             None => "Export clip".into(),
         };
-        if ui.add_enabled(can, theme::primary_button(&export_label).min_size(egui::vec2(ui.available_width(), 36.0))).clicked() {
+        if !self.montage_on && ui.add_enabled(can, theme::primary_button(&export_label).min_size(egui::vec2(ui.available_width(), 36.0))).clicked() {
             self.start_export(ctx);
         }
         if let Some(e) = &self.export {
@@ -1986,6 +2443,145 @@ impl Editor {
         }
     }
 
+    fn speed_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            theme::section(ui, "Speed");
+            if !self.speed_zones.is_empty() {
+                ui.label(RichText::new(format!("{} / {}", self.speed_zones.len(), speed::MAX_ZONES)).small().color(theme::MUTED));
+            }
+        });
+        let blocked = self.speed_blocked_reason();
+        let pos = self.position();
+        let trim = self.trim();
+        let fin_map = self.time_map();
+        let fin_s0 = trim.map_or(0.0, |t| t.0);
+        let sel = self.sel_speed;
+        let (mut select, mut select_quiet, mut delete, mut add, mut whole) = (None, None, None, false, false);
+        ui.add_enabled_ui(blocked.is_none(), |ui| {
+            if self.speed_zones.is_empty() {
+                theme::hint(ui, "Slow motion or fast forward for part of the clip. Add a zone, set its start, end and speed. The timeline stretches to show the new length.");
+            }
+            for (i, z) in self.speed_zones.iter_mut().enumerate() {
+                let col = speed_color(z.speed);
+                let selected = sel == Some(i);
+                let frame = theme::card().stroke(Stroke::new(if selected { 1.5 } else { 1.0 }, if selected { col } else { theme::BORDER }));
+                let r = frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 5.0, col);
+                        if ui.selectable_label(selected, RichText::new(format!("Speed {}", i + 1)).strong().color(col)).on_hover_text("Select and jump to its start").clicked() {
+                            select = Some(i);
+                        }
+                        ui.label(RichText::new(z.label()).small().color(theme::MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Delete").clicked() {
+                                delete = Some(i);
+                            }
+                        });
+                    });
+                    if z.whole {
+                        theme::hint(ui, "Whole clip: covers your trim, and follows it if the trim changes.");
+                    } else {
+                        ui.columns(2, |cols| {
+                            for (c, (label, text)) in [("Start", &mut z.start_text), ("End", &mut z.end_text)].into_iter().enumerate() {
+                                let ui = &mut cols[c];
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(label).small().color(theme::MUTED));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("Use playhead").clicked() {
+                                            *text = timecode::format_compact(pos);
+                                        }
+                                    });
+                                });
+                                ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY));
+                                time_feedback(ui, text);
+                                if let Some(f) = final_text(&fin_map, fin_s0, text) {
+                                    theme::hint(ui, f);
+                                }
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(&mut z.speed, speed::MIN_SPEED..=speed::MAX_SPEED).step_by(0.25).show_value(false));
+                        ui.add(egui::DragValue::new(&mut z.speed).range(speed::MIN_SPEED..=speed::MAX_SPEED).speed(0.01).max_decimals(2).suffix("×"));
+                        if z.speed != 1.0 && ui.small_button("Reset").on_hover_text("Back to normal speed").clicked() {
+                            z.speed = 1.0;
+                        }
+                    });
+                    if let Some((s, e)) = z.times(trim) {
+                        if e > s {
+                            theme::hint(ui, format!("{} becomes {}", timecode::format_short(e - s), timecode::format_short((e - s) / z.speed.clamp(speed::MIN_SPEED, speed::MAX_SPEED))));
+                        }
+                    }
+                    ui.add_enabled_ui(z.speed < 1.0, |ui| {
+                        ui.checkbox(&mut z.smooth, "Smooth slow-mo")
+                            .on_hover_text("Makes in-between frames so slow motion doesn't look choppy.")
+                            .on_disabled_hover_text("Only for slow motion (under 1×).");
+                    });
+                    if z.smooth && z.speed < 1.0 {
+                        theme::warn(ui, "Smooth slow-mo makes the export much slower.");
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Audio").small().color(theme::MUTED));
+                        ui.selectable_value(&mut z.mute, false, "Keep").on_hover_text("Keep the sound, sped up or slowed down. Voices keep their normal pitch unless Change pitch is ticked.");
+                        ui.selectable_value(&mut z.mute, true, "Mute").on_hover_text("Silence this zone.");
+                    });
+                });
+                if !selected && r.response.contains_pointer() && ui.input(|i| i.pointer.primary_pressed()) {
+                    select_quiet = Some(i);
+                }
+            }
+            let full = self.speed_zones.len() >= speed::MAX_ZONES;
+            let label = match self.settings.keybinds.get(Action::NewSpeedZone) {
+                Some(b) => format!("+ New speed zone   ({})", b.display()),
+                None => "+ New speed zone".into(),
+            };
+            ui.horizontal(|ui| {
+                let w = if self.speed_zones.is_empty() { (ui.available_width() - 8.0) * 0.6 } else { ui.available_width() };
+                if ui
+                    .add_enabled(!full, egui::Button::new(label).min_size(egui::vec2(w, 26.0)))
+                    .on_disabled_hover_text("You can have up to 20 speed zones. Delete one to add another.")
+                    .clicked()
+                {
+                    add = true;
+                }
+                if self.speed_zones.is_empty()
+                    && ui
+                        .add(egui::Button::new("Whole clip").min_size(egui::vec2(ui.available_width(), 26.0)))
+                        .on_hover_text("One speed for the whole trimmed clip")
+                        .clicked()
+                {
+                    whole = true;
+                }
+            });
+            if !self.speed_zones.is_empty() {
+                ui.checkbox(&mut self.settings.options.change_pitch, "Change pitch with speed")
+                    .on_hover_text("Off: voices sound normal at any speed. On: faster = higher, like a sped-up tape.");
+            }
+        });
+        if let Some(why) = blocked {
+            if self.media.is_some() {
+                theme::warn(ui, why);
+            }
+        }
+        if let Some(i) = delete {
+            self.sel_speed = Some(i);
+            self.delete_selected_speed();
+        } else if add {
+            self.new_speed_zone();
+        } else if whole {
+            self.speed_zones.push(SpeedZone::whole_clip());
+            self.select_speed(0);
+        } else if let Some(i) = select {
+            self.select_speed(i);
+            if let Some((s, _)) = self.speed_zones[i].times(trim) {
+                self.seek(s);
+            }
+        } else if let Some(i) = select_quiet {
+            self.select_speed(i);
+        }
+    }
+
     fn zoom_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             theme::section(ui, "Zoom");
@@ -1998,8 +2594,12 @@ impl Editor {
         let edit_end_box = self.edit_end_box;
         let sel_zone = self.sel_zone;
         let drawing_now = self.drawing;
+        let fin_map = self.time_map();
+        let fin_s0 = self.trim().map_or(0.0, |t| t.0);
         let (mut select, mut select_quiet, mut delete, mut draw) = (None, None, None, None);
         let (mut pick, mut unlock) = (None, None);
+        let tctx = self.track_ctx();
+        let mut track_acts: Vec<(usize, track_ui::TrackAct)> = Vec::new();
         ui.add_enabled_ui(blocked.is_none(), |ui| {
             if self.zones.is_empty() {
                 theme::hint(ui, "Zoom into part of the picture for a stretch of time. Add a zone, then draw a box on the video.");
@@ -2068,6 +2668,9 @@ impl Editor {
                             });
                             ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY));
                             time_feedback(ui, text);
+                            if let Some(f) = final_text(&fin_map, fin_s0, text) {
+                                theme::hint(ui, f);
+                            }
                         }
                     });
                     // Under the times: Smooth on the left, No box change on the right.
@@ -2090,6 +2693,19 @@ impl Editor {
                             }
                         }
                     });
+                    if ui
+                        .checkbox(&mut z.track, "Track: follow what's in the box")
+                        .on_hover_text("The zoom follows something moving, like a player. Draw the start box around it, then click Track.")
+                        .changed()
+                        && z.track
+                    {
+                        z.pan = false;
+                    }
+                    if z.track {
+                        if let Some(a) = track_ui::track_controls(ui, i, z, &tctx) {
+                            track_acts.push((i, a));
+                        }
+                    }
                     if z.max_zoom() > zoom::WARN_ZOOM + 1e-6 {
                         theme::warn(ui, "Over 3x zoom: the picture will look soft.");
                     }
@@ -2125,6 +2741,12 @@ impl Editor {
                 theme::warn(ui, why);
             }
         }
+        if let Some(n) = &self.track_note {
+            theme::hint(ui, n.clone());
+        }
+        for (i, a) in track_acts {
+            self.apply_track_act(i, a);
+        }
         if let Some(i) = delete {
             self.sel_zone = Some(i);
             self.delete_selected_zone();
@@ -2147,6 +2769,7 @@ impl Editor {
             self.select_zone(i);
         } else if let Some(i) = select_quiet {
             self.sel_zone = Some(i);
+            self.sel_speed = None;
             self.edit_end_box = false;
         }
     }
@@ -2369,9 +2992,10 @@ impl Editor {
         let (Some(m), Some((s, e))) = (self.media.as_ref(), self.trim()) else { return };
         let o = self.effective_opts();
         let out = PathBuf::new();
-        let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[], tracks: &self.tracks };
+        let speeds = self.active_speeds();
+        let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[], tracks: &self.tracks, speed_zones: &speeds, overlays: &[], montage: None };
         let est = job::estimate(&j);
-        let dur = job::output_duration(s, e, o.effective_speed());
+        let dur = job::output_duration(s, e, &speeds);
         let plan = if self.discord_active() { self.discord_plan().and_then(Result::ok) } else { None };
         let cap = self.settings.options.preset;
         theme::card().show(ui, |ui| {
@@ -2793,13 +3417,14 @@ impl ClipList<'_> {
 
 /// A waveform: one bar per pixel column, mirrored around the middle.
 /// `level(t0, t1)` gives the loudest moment (0-1) between two times.
-fn draw_wave(painter: &egui::Painter, rect: egui::Rect, duration: f64, color: Color32, level: impl Fn(f64, f64) -> f32) {
+/// `t_at(f)` is the time a fraction `f` (0-1) of the way along.
+fn draw_wave(painter: &egui::Painter, rect: egui::Rect, t_at: &dyn Fn(f64) -> f64, color: Color32, level: impl Fn(f64, f64) -> f32) {
     let cols = rect.width().max(1.0) as usize;
-    let step = duration / cols as f64;
     let mid = rect.center().y;
     let half = rect.height() / 2.0;
     for c in 0..cols {
-        let h = waveform::height(level(c as f64 * step, (c + 1) as f64 * step)) * half;
+        let (t0, t1) = (t_at(c as f64 / cols as f64), t_at((c + 1) as f64 / cols as f64));
+        let h = waveform::height(level(t0, t1.max(t0 + 1e-3))) * half;
         if h >= 0.5 {
             let x = rect.left() + c as f32 + 0.5;
             painter.line_segment([egui::pos2(x, mid - h), egui::pos2(x, mid + h)], Stroke::new(1.0, color));

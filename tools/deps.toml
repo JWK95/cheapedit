@@ -30,3 +30,29 @@ sha256 = "273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452"
 source_url = "https://github.com/mpv-player/mpv/archive/bcde6b93cca4d128d84e1a60d1a6db2cd81c889e.tar.gz"
 source_name = "mpv-20261111-git-bcde6b93cc-source.tar.gz"
 source_sha256 = "d87d17a4a6fde0c963db1425cae6d4b413788bb935353d3cfedb376acd15cd5f"
+
+# Object tracking (tracked zoom zones). ONNX Runtime's DirectML build runs on
+# the CPU, or on the graphics card through DirectML. 1.24.4 is the last
+# DirectML build Microsoft published. ONNX Runtime: MIT licence.
+[onnxruntime]
+version = "1.24.4"
+build = "Microsoft.ML.OnnxRuntime.DirectML (NuGet)"
+url = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg"
+sha256 = "57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681"
+
+# Microsoft's DirectML runtime, which ONNX Runtime's GPU mode needs.
+# Redistributable under Microsoft's DirectML licence (shipped in licenses).
+[directml]
+version = "1.15.4"
+build = "Microsoft.AI.DirectML (NuGet)"
+url = "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg"
+sha256 = "4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9"
+
+# The tracker model: VitTrack from OpenCV's model zoo (Apache 2.0).
+[vittrack]
+version = "2023sep"
+build = "opencv_zoo object_tracking_vittrack"
+url = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/object_tracking_vittrack/object_tracking_vittrack_2023sep.onnx"
+sha256 = "2990f0b7cd44d92afa48cd97db6de7be113fc1d9594fddb74e2725c10478e91d"
+license_url = "https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/object_tracking_vittrack/LICENSE"
+license_sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"

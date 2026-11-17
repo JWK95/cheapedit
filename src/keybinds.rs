@@ -24,10 +24,14 @@ pub enum Action {
     TimelineEnd,
     NewZone,
     DeleteZone,
+    NewSpeedZone,
+    NewTextOverlay,
+    OpenKlipy,
+    AddToMontage,
 }
 
 impl Action {
-    pub const ALL: [Action; 15] = [
+    pub const ALL: [Action; 19] = [
         Action::PlayPause,
         Action::FrameBack,
         Action::FrameForward,
@@ -42,6 +46,10 @@ impl Action {
         Action::TimelineStart,
         Action::TimelineEnd,
         Action::NewZone,
+        Action::NewSpeedZone,
+        Action::NewTextOverlay,
+        Action::OpenKlipy,
+        Action::AddToMontage,
         Action::DeleteZone,
     ];
     /// Bound to a modifier + mouse click on the timeline, not to a key.
@@ -64,7 +72,11 @@ impl Action {
             Action::TimelineStart => "Click timeline: set start",
             Action::TimelineEnd => "Click timeline: set end",
             Action::NewZone => "New zoom zone",
-            Action::DeleteZone => "Delete selected zoom zone",
+            Action::DeleteZone => "Delete selected zone or overlay",
+            Action::NewTextOverlay => "New text overlay",
+            Action::OpenKlipy => "Search KLIPY for a GIF",
+            Action::AddToMontage => "Add clip to montage",
+            Action::NewSpeedZone => "New speed zone",
         }
     }
     /// Short label for the on-screen keyboard.
@@ -85,6 +97,10 @@ impl Action {
             Action::TimelineEnd => "end",
             Action::NewZone => "Zone",
             Action::DeleteZone => "Del zone",
+            Action::NewSpeedZone => "Speed",
+            Action::NewTextOverlay => "Text",
+            Action::OpenKlipy => "GIFs",
+            Action::AddToMontage => "Montage",
         }
     }
     /// Shown in the strip under the player.
@@ -189,6 +205,10 @@ impl Default for Keybinds {
         map.insert(Action::TimelineEnd, Binding::click(shift));
         map.insert(Action::NewZone, Binding::plain(Key::Z));
         map.insert(Action::DeleteZone, Binding::plain(Key::Delete));
+        map.insert(Action::NewSpeedZone, Binding::plain(Key::S));
+        map.insert(Action::NewTextOverlay, Binding::plain(Key::T));
+        map.insert(Action::OpenKlipy, Binding::plain(Key::G));
+        map.insert(Action::AddToMontage, Binding::plain(Key::M));
         Keybinds { map }
     }
 }

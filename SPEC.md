@@ -18,6 +18,7 @@ Changed on 2026-11-17 at the user's request: cheapedit now **bundles** FFmpeg an
 - **All three are required:** `ffmpeg.exe`, `ffprobe.exe` and `libmpv-2.dll`. If anything is missing everywhere, the app stays on the setup screen. There is no partial or export-only mode.
 - **Bundled copies** ship in a `deps\` folder next to `cheapedit.exe`:
   - FFmpeg: Gyan's **full, shared** build (ffmpeg.exe, ffprobe.exe and their DLLs). It includes SVT-AV1, NVENC, AMF, QSV, x264, x265, VP9, Opus and zimg (zscale).
+  - From v0.6, for tracked zoom zones (section 5b): ONNX Runtime (DirectML build), DirectML.dll and `models\vittrack.onnx`. These are only needed for tracking: if they're missing, Track explains it and everything else works. They're always the bundled copies (never from PATH).
   - libmpv: shinchiro's `mpv-dev` **x86_64** build (not `-v3`, which needs AVX2).
   - Licence texts in `deps\licenses\`, and `deps\VERSIONS.txt` naming the exact builds.
   - Nothing is added to PATH or installed system-wide. Everything stays in cheapedit's own folder and goes with the uninstaller.
@@ -96,6 +97,23 @@ A drawer on the far left with two file lists, one above the other.
 - A source that's renamed or moved loses its tick. The tick **stays** if the export is deleted: it records that the clip was dealt with.
 - **One-time catch-up:** the first time history is kept (once the clips list has been scanned and an output folder is set), any file in the output folder named `<source name>_…` (the naming before v0.4.0) marks that source as exported, using the file's modified time.
 
+## 3b. Montage mode (v0.6)
+
+Edit several clips one after another and join them into one file.
+
+- **Montage** toggle in the top bar. With no montage open, a **Montage** window asks for a **projects folder** (first time; remembered, changeable), then offers **New montage** (a name) or a list of the folder's montages (newest first) to open. Closing it turns Montage mode off.
+- **Projects:** each montage is its own file, `<name>.cheapmontage` (JSON), in the projects folder. Every change is **saved automatically** (half a second after it stops changing, via a temporary file so a crash can't lose it).
+- **Montage strip** under the timeline: one card per clip, in order, with its number, name and finished length, and the **total length and clip count** at the end. Drag a card to move it (a coral line shows where it lands). Right-click: Duplicate, Remove (and Find file… when missing).
+- **Montage section** at the top of the tools: the project name, "Saved automatically", **Add to montage** (or `M`), what happened last, and **Size** for the finished file: "Same as the first clip" (default) or 1920x1080, 1280x720, 2560x1440, 1080x1920, 1080x1080 at the first clip's frame rate, 30 or 60. **Switch** goes back to the Montage window.
+- **Adding:** stores the open clip's **recipe**: source, trim, speed zones, zoom zones, overlays, audio tracks, audio mode, volume and pitch setting. Nothing is rendered yet. Audio-only files can't be added.
+- **Re-editing:** clicking a card opens that clip with its recipe; it shows "Editing", and changes save into the card by themselves. Opening another file stops editing that card.
+- **Missing source:** the card turns red ("File missing"); clicking it (or Find file…) picks its new location. Finish is blocked until it's fixed or removed.
+- **Finish montage** replaces Export (and the Estimate card) while Montage is on. One set of Quality / codec / Preset settings applies to every clip, always in **Precise** mode. A Discord preset plans for the whole montage's length.
+  - **Size and frame rate:** every clip is fitted to the montage's size (black bars, never stretched) at its frame rate, cut to a whole number of frames, with 48 kHz stereo sound cut to exactly the same length (a clip without sound, or with "Remove audio", gets a silent track). So the clips join **without re-encoding** and the sound never drifts.
+  - **Hard cuts** between clips. Each clip keeps its own audio; there is no montage-wide music.
+  - Each clip is rendered into a work folder, `.cheapedit-montage`, inside the output folder, then joined with the concat demuxer (`-c copy`). Work files are deleted afterwards, also after a failure or Cancel. One progress bar covers all clips and the join. A clip whose zones or overlays have a problem stops the finish with "Clip N: … Click its card to fix it."
+- **Name:** the montage name and the date, `Valorant highlights 17-11-26 21-04.mp4`. Every source clip gets the green exported tick.
+
 ## 4. Output
 
 - **The output folder is required.** It's remembered between sessions, and Export is blocked until it's set, exists and is writable.
@@ -144,6 +162,54 @@ Zoom into part of the picture for a stretch of time. Done entirely with FFmpeg (
 - **Shortcuts:** `Z` new zone, `Delete` delete the selected zone (both rebindable).
 - Zones are **not saved** between sessions and are cleared when another video is opened.
 
+## 5b. Tracked zoom zones (v0.6)
+
+A zoom zone can follow something on screen by itself.
+
+- **"Track: follow what's in the box"** checkbox on a zoom zone card (turns off panning). Draw the Start box around the thing to follow and click **Track**: it runs in the background with a progress bar and Cancel (one zone at a time), then the zoom follows it for the whole zone. **Track again** starts over from the start box.
+- **Tracker:** the **VitTrack** model from OpenCV's model zoo (Apache 2.0), run with **ONNX Runtime 1.24.4 (DirectML build)**, both bundled in `deps\` (`onnxruntime.dll`, `DirectML.dll`, `modelsittrack.onnx`, about 36 MB together) with their licences, pinned in `tools\deps.toml`. Changed from NanoTrack on 2026-11-17: NanoTrack's models state no licence, so they can't be shipped; VitTrack is the same kind of small, fast tracker. 1.24.4 is the last ONNX Runtime with a DirectML build.
+  - Pre- and post-processing follow OpenCV's TrackerVit: a 128x128 template from twice the box, a 256x256 search area four times the box, BGR pixels with ImageNet mean/std, a 16x16 score map weighted by a Hann window; below a 0.2 score the target counts as lost for that frame and the box holds still.
+  - Frames come from FFmpeg as raw pictures, at most 640 wide and 30 per second.
+- **CPU or GPU:** the CPU by default; **Features** can switch to the graphics card (DirectML). If the GPU fails, it uses the CPU by itself, logs why, and Features shows it ("Last run: GPU failed (…), so the CPU was used.").
+- **The box keeps its size** (the zoom level doesn't pump in and out); only its position follows. A **Smoothness** slider (Gaussian smoothing, up to 0.8 s) makes the camera glide. Smooth glide in and out of the zone still applies.
+- **Fixing mistakes:** pause where it went wrong and click **Fix at playhead**; a yellow box appears on the video, drag it onto the target and let go. That frame becomes a **fix** and tracking re-runs **forwards** from it, keeping everything before. Fixes are listed on the card with **Remove** (tracks again from the fix before it). Smoothing never blurs across a fix.
+- **On the video:** after the zone's first frame, Original shows the tracked box ("Zone N - tracked") where the zoom will be.
+- **Export:** the smoothed path is simplified to at most 40 keyframes per zone (straight lines between them, within 0.2% of the frame), built into the same zoompan expressions as other zones. **Preview** drives mpv's zoom/pan from the same path. If the tracked zones together would make the command line too long for Windows, Export is blocked with a hint to raise Smoothness or use fewer tracked zones. A zone set to Track that hasn't been tracked blocks Export too.
+- Tracked paths are saved with a montage's clips.
+
+## 5c. Overlays (v0.6)
+
+Images, GIFs, videos and text on top of the clip.
+
+- **Panel:** under Zoom. **"+ Image or GIF"**, **"+ Video"**, **"+ Text"**, and **"Search KLIPY"** (section 5d). Up to **20 overlays**. Greyed out in Fast cut mode and for "Audio only".
+- **Assets:** an **Assets folder** the user chooses (like the clips folder, remembered) is listed inside the panel: images, GIFs, WebP and videos (newest first, with the file type), in a short scrolling list. Clicking one adds it as an overlay at the playhead. "+ Image or GIF" / "+ Video" can also pick any file.
+- **Each overlay is a card**, like a zoom zone: type and number, name, ▲/▼ (Bring forward / Send back) and Delete; start and end times (original time, with "= in final video"); **Start position / End position** and **No position change** (on = stays put; off = eased glide from the start position to the end position).
+- **Placing:** a new overlay appears centred (media a third of the frame wide). The selected overlay is shown at the position being edited while paused: drag it to move it, drag a corner to resize a picture or video (keeping its shape). The end position only moves it; its size stays the start's. Text is sized with its Size slider.
+- **Controls on every overlay:** opacity (0–100 %), fade in and fade out (0–2 s), **Bring forward / Send back** (the card order is the layer order; later cards are on top).
+- **GIF / animated WebP:** Loop (default) or Play once (then holds the last frame).
+- **Video:** its sound is off by default; **Sound** turns it on, with a volume slider on the card (mixed into the clip's single audio track). **"Follow clip speed"** (off by default): when on, it speeds up and slows down with the speed zones.
+- **Text:** the text (several lines allowed), a font from the fonts installed in Windows, size, colour, outline (colour, width), shadow, and a background box (colour, opacity). Built with FFmpeg's `drawtext`.
+- **Speed:** GIFs, images and text always play at normal speed, even inside a speed zone.
+- **Timeline:** each overlay is a band under the speed and zoom bands, in its card's colour.
+- **Preview:** cheapedit draws the overlays over the player itself (in both views, while editing): pictures and animated GIF/WebP frames, and text with its font, outline, shadow, background, opacity, fades and movement. Video overlays show a still frame in the preview; the export plays them. Text may differ slightly from the export in spacing.
+- **Layers:** the card order is the layer order, except that "Follow clip speed" videos always sit under the other overlays (they're added before the speed change).
+- **Checks that block Export:** a box not drawn; an overlay not inside the trim; an overlay file missing; empty text.
+- **Shortcut:** `T` new text overlay.
+- Overlays are not saved between sessions (except inside a montage).
+
+## 5d. KLIPY GIF search (v0.6)
+
+Uses KLIPY's GIF API (`https://api.klipy.com/api/v1/{key}/gifs/search` and `/gifs/trending`, 24 per page, `content_filter=off`) through Windows' own `curl.exe`, like the update check.
+
+- **Features** (a top-bar button, a small window) has a **KLIPY API key** box (hidden like a password, with Show) and "How to get a free key": make an account at partner.klipy.com, create a platform under API Keys, paste the key. It explains why it's your own key, the Testing-mode limit (100 searches an hour until KLIPY grants Production access), and where the key is kept (cheapedit's settings file). Without a key, "Search KLIPY" opens Features instead.
+- **KLIPY's terms:** they say apps shouldn't store KLIPY GIFs (only search thumbnails). The user chose (2026-11-17) to download picked GIFs into Assets anyway; the guide says so plainly and points to developers@klipy.com.
+- **Search window:** a box with the placeholder "Search KLIPY" (required by KLIPY), results after a short pause in typing (or Enter), Trending when the box is empty, a grid of animated previews in KLIPY's order (nothing re-ordered or filtered), "Powered by KLIPY", and **More** for the next page. Ads or other non-GIF items in the results are skipped.
+- **Clicking a result** downloads it (HD, or the next size down) to the Assets folder as **WebP when offered, otherwise GIF** (both keep transparency), named after the search plus its id (`gg-ez_8421.webp`; reused if already there), and adds it as an overlay at the playhead. Downloads go through a `.part` file, so a failed one leaves nothing behind. Without an Assets folder it asks for one first.
+- Thumbnails are cached in the temp folder while the app runs.
+- Animated WebP overlays loop with FFmpeg's `loop` filter (`-stream_loop` hangs on animated WebP); GIFs use `-ignore_loop 0`.
+- Network errors, a rejected key and a used-up limit are shown in plain English. Only the search text and the key are sent to KLIPY; no user id.
+- **Shortcut:** `G` opens the search.
+
 ## 6. Cut modes
 
 | Mode | What it does | Plain-English explanation in the app |
@@ -154,11 +220,23 @@ Zoom into part of the picture for a stretch of time. Done entirely with FFmpeg (
 - In Fast mode, speed, codec, quality, frame rate, resolution and volume are **greyed out**, with the note "Switch to Precise to change this."
 - Remove audio, mute, and changing the container all still work in Fast mode, as long as the new format can hold the source's codecs.
 
-## 7. Speed
+## 7. Speed zones (replaces the speed slider in v0.6)
 
-- Slider from 0.25× to 4× in 0.25 steps, plus a box for typed values.
-- **Pitch is kept normal by default**, using FFmpeg's `atempo` filter (chained for extreme values).
-- "Change pitch with speed" checkbox (tape-style, using `asetrate` + `aresample`).
+Change the speed of parts of the clip: slow motion or fast forward between a start and an end time.
+
+- **Panel:** where the old Speed section was. With no zones it shows **"+ New zone"**, a **"Whole clip"** button (one zone covering the trim, which does what the old slider did) and a one-line explanation. Up to **20 zones**.
+- **Greyed out** in Fast cut mode, with the reason, like zoom. They also work for "Audio only" (the MP3 is sped up or slowed down).
+- **Each zone is a card:** its number, its speed (e.g. `0.5x`) and a delete button; start and end times (typed like trim, with "Use playhead"); a **speed slider** from 0.25× to 4× in 0.25 steps plus a box for typed values; and:
+  - **Smooth slow-mo** (only below 1×, off by default): FFmpeg's `minterpolate` makes the in-between frames. A note says it makes the export much slower.
+  - **Audio:** **Keep (pitch-corrected)** (default, `atempo`, chained for extreme values) or **Mute**.
+  - "Change pitch with speed" (tape-style, `asetrate` + `aresample`) stays as one checkbox for all zones.
+- **Times refer to the original video**, like trim and zoom. Each time box shows `h:mm:ss.ms` and, below it, "= 0:14.2 in final video".
+- **The timeline shows finished-video time in both views.** A 0.5× zone takes twice its width, a 2× zone half. Zones are coloured bands under the timeline, like zoom zones (dragging edges changes their times). The timeline re-flows **when the mouse is released**; while dragging, a label under the timeline shows the change ("New length 0:42 to 0:58"; drawn glyphs only, since arrows and triangles aren't in the built-in fonts). The end-time label and "New clip length" show the finished length.
+- **Original view** plays at normal speed (the playhead moves slower through a stretched slow zone). **Result view** plays the zones at their speeds.
+- **Checks that block Export** (same wording style as zoom): zones overlap (offers a fix); a zone isn't inside the trim (offers "Shrink zone to fit" / "Delete zone"); a zone is shorter than 0.1 s.
+- **Export:** the trimmed clip is split at zone edges with `trim`/`atrim`, each piece gets its own `setpts` (and `minterpolate` / `atempo` / silence), then `concat` joins them. Zoom (and video overlays with "Follow clip speed") is applied **before** speed. Other overlays are applied **after** speed, with their times converted to finished-video time, so GIFs and text play at normal speed.
+- **Shortcut:** `S` new speed zone. `Delete` deletes the selected zone or overlay.
+- Zones are not saved between sessions (except inside a montage, section 3b).
 
 ## 8. Audio and video modes
 
@@ -280,7 +358,11 @@ Recorders like ShadowPlay can put game sound and the microphone on separate trac
 | `Ctrl+E` | Export |
 | `Ctrl+O` | Open file |
 | `Z` | New zoom zone |
-| `Delete` | Delete selected zoom zone |
+| `Delete` | Delete the selected zone or overlay |
+| `S` | New speed zone |
+| `T` | New text overlay |
+| `G` | Open the KLIPY search |
+| `M` | Add the current clip to the montage |
 | `Ctrl+Click` on the timeline | Set start there (drag to keep moving it) |
 | `Shift+Click` on the timeline | Set end there (drag to keep moving it) |
 
@@ -306,6 +388,8 @@ The timeline-click bindings are rebound by choosing a modifier: Ctrl, Shift, Alt
 
 - Stored in `%APPDATA%\cheapedit\settings.toml`.
 - Holds the output folder, last-used options (including the preset), keybindings, the Clips drawer's folder, open/closed state, width, split and Audio checkboxes, and the Ghost and Waveform toggles. Export history is kept separately in `exports.json`.
+- From v0.6 it also holds the Assets folder, the montage folder, the KLIPY key and the tracker's CPU/GPU choice.
+- **Features window** (v0.6, top-bar button): the KLIPY key with its guide, and the tracker's **CPU / Graphics card (GPU)** choice with what the last run used.
 
 ## 16. Installer and branding
 
@@ -327,7 +411,7 @@ The timeline-click bindings are rebound by choosing a modifier: Ctrl, Shift, Alt
   - `tools\dev.ps1` runs it once if `target\deps` is missing, so dev builds use the same files the installer ships.
 - **Unsigned for now.** The README explains the SmartScreen warning.
 - **Auto-update from GitHub releases** (public repo `JWK95/cheapedit`). Changed from "no update checks" on 2026-11-07 at the user's request.
-  - One check on startup against the GitHub "latest release" API, done with Windows' built-in `curl.exe`. It can be switched off in **About**, and there's a **Check now** button there too. This is the only network traffic the app ever makes, and it sends nothing about the user. (Downloading FFmpeg and libmpv happens only on the developer's machine, in `fetch-deps.ps1`, never in the app.)
+  - One check on startup against the GitHub "latest release" API, done with Windows' built-in `curl.exe`. It can be switched off in **About**, and there's a **Check now** button there too. Apart from the KLIPY search (section 5d, only when the user has added their own key and searches), this is the only network traffic the app ever makes, and it sends nothing about the user. (Downloading FFmpeg and libmpv happens only on the developer's machine, in `fetch-deps.ps1`, never in the app.)
   - A newer version shows a banner with **Update now / What's new / Later**. Nothing installs without a click, and updating is blocked while an export is running.
   - The installer is downloaded, its SHA-256 is checked against the `.sha256` file published with the release (a release without one is refused), and it then runs with `/SILENT /RELAUNCH=1`. It updates in place, keeps settings, and reopens cheapedit.
 - **Dev and release builds.**
@@ -338,7 +422,8 @@ The timeline-click bindings are rebound by choosing a modifier: Ctrl, Shift, Alt
 
 ## 17. Out of scope for v1
 
-- multiple segments and joining them
+- multiple trim segments inside one clip (joining whole clips is Montage mode, section 3b)
+- transitions between montage clips, montage-wide music, overlay rotation (not planned for v0.6)
 - an export queue
 - test renders
 - HDR output

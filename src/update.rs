@@ -103,12 +103,12 @@ pub fn parse_sha_file(text: &str) -> Option<String> {
     (h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())).then_some(h)
 }
 
-fn curl() -> PathBuf {
+pub(crate) fn curl() -> PathBuf {
     let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     root.join(r"System32\curl.exe")
 }
 
-fn curl_base(max_secs: u32) -> std::process::Command {
+pub(crate) fn curl_base(max_secs: u32) -> std::process::Command {
     let mut c = winutil::hidden_command(&curl());
     c.args(["--silent", "--show-error", "--fail", "--location", "--proto", "=https", "--max-time", &max_secs.to_string()]);
     c.args(["-H", &format!("User-Agent: cheapedit/{CURRENT}")]);

@@ -7,6 +7,8 @@
 //! Pure (no I/O), so all of it is unit-tested.
 
 use crate::timecode;
+use crate::tracker::Point;
+use std::sync::Arc;
 
 pub const MAX_ZONES: usize = 20;
 /// A box can't be smaller than this fraction of the frame (10× zoom).
@@ -20,7 +22,7 @@ pub const MIN_HARD_LEN: f64 = 0.1;
 /// A box on the frame, as fractions of the frame: top-left corner and size.
 /// The size is the same fraction of the width and the height, so the box
 /// always has the video's shape.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ZBox {
     pub x: f64,
     pub y: f64,
@@ -59,7 +61,8 @@ impl ZBox {
 }
 
 /// One zone as the user edits it (times are text, like the trim boxes).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Zone {
     pub start_text: String,
     pub end_text: String,
@@ -73,6 +76,21 @@ pub struct Zone {
     /// Whether the user has drawn each box yet.
     pub a_drawn: bool,
     pub b_drawn: bool,
+    /// Follow what's in the start box (tracked by `tracker`).
+    pub track: bool,
+    /// 0 = follow every wobble, 1 = a slow, steady glide.
+    pub smoothness: f64,
+    /// Where the target's centre was found, over time (original time).
+    pub track_points: Vec<Point>,
+    /// Places the user redrew the box; tracking restarts from each.
+    pub locks: Vec<Lock>,
+}
+
+/// A fix: at time `t` the target is in box `b`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Lock {
+    pub t: f64,
+    pub b: ZBox,
 }
 
 impl Zone {
@@ -88,20 +106,31 @@ impl Zone {
             b: a,
             a_drawn: false,
             b_drawn: false,
+            track: false,
+            smoothness: 0.5,
+            track_points: Vec::new(),
+            locks: Vec::new(),
         }
+    }
+    /// Tracked, with a path to follow.
+    pub fn tracked(&self) -> bool {
+        self.track && !self.track_points.is_empty()
     }
     pub fn times(&self) -> Option<(f64, f64)> {
         Some((timecode::parse(&self.start_text).ok()?, timecode::parse(&self.end_text).ok()?))
     }
     pub fn resolve(&self) -> Option<Resolved> {
         let (start, end) = self.times()?;
-        Some(Resolved {
-            start,
-            end,
-            glide: if self.smooth { self.glide } else { 0.0 },
-            a: self.a,
-            b: if self.pan { self.b } else { self.a },
-        })
+        let glide = if self.smooth { self.glide } else { 0.0 };
+        if self.tracked() {
+            let path = track_path(&self.track_points, &self.locks, self.smoothness, self.a.s, start, end, MAX_TRACK_KEYS);
+            if !path.is_empty() {
+                let a = box_at(&path, start + glide);
+                let b = box_at(&path, end - glide);
+                return Some(Resolved { start, end, glide, a, b, path: Some(Arc::new(path)) });
+            }
+        }
+        Some(Resolved { start, end, glide, a: self.a, b: if self.pan { self.b } else { self.a }, path: None })
     }
     /// The strongest enlargement this zone uses.
     pub fn max_zoom(&self) -> f64 {
@@ -110,13 +139,114 @@ impl Zone {
 }
 
 /// A zone with its times worked out. Glide is 0 for a hard cut.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Resolved {
     pub start: f64,
     pub end: f64,
     pub glide: f64,
     pub a: ZBox,
     pub b: ZBox,
+    /// A tracked zone's camera path: keyframes the view moves between in
+    /// straight lines (a and b are where it is after the glide in and before
+    /// the glide out).
+    pub path: Option<Arc<Vec<(f64, ZBox)>>>,
+}
+
+/// Most keyframes one tracked zone's path may have. Each one adds to the
+/// FFmpeg command line, which Windows limits to 32,767 characters.
+pub const MAX_TRACK_KEYS: usize = 40;
+
+/// The box at `t` along a keyframed path (held before the first and after the last).
+pub fn box_at(path: &[(f64, ZBox)], t: f64) -> ZBox {
+    match path.iter().position(|k| k.0 > t) {
+        None => path.last().map_or(ZBox::FULL, |k| k.1),
+        Some(0) => path[0].1,
+        Some(i) => {
+            let (a, b) = (path[i - 1], path[i]);
+            ZBox::lerp(a.1, b.1, (t - a.0) / (b.0 - a.0).max(1e-9))
+        }
+    }
+}
+
+/// Gaussian smoothing of the centres over time; `sigma` in seconds.
+fn smooth_points(pts: &[Point], sigma: f64) -> Vec<Point> {
+    if sigma <= 1e-6 || pts.len() < 3 {
+        return pts.to_vec();
+    }
+    pts.iter()
+        .map(|p| {
+            let (mut sx, mut sy, mut sw) = (0.0, 0.0, 0.0);
+            for q in pts {
+                let d = q.t - p.t;
+                if d.abs() > 3.0 * sigma {
+                    continue;
+                }
+                let w = (-0.5 * (d / sigma).powi(2)).exp();
+                sx += q.x * w;
+                sy += q.y * w;
+                sw += w;
+            }
+            Point { t: p.t, x: sx / sw, y: sy / sw }
+        })
+        .collect()
+}
+
+/// Keep only the keyframes needed so straight lines between them stay
+/// within `tol` of every point (Ramer-Douglas-Peucker on x and y over time).
+fn simplify(pts: &[(f64, ZBox)], tol: f64) -> Vec<(f64, ZBox)> {
+    if pts.len() <= 2 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; pts.len()];
+    keep[0] = true;
+    keep[pts.len() - 1] = true;
+    let mut stack = vec![(0, pts.len() - 1)];
+    while let Some((i, j)) = stack.pop() {
+        let (a, b) = (pts[i], pts[j]);
+        let mut worst = (0.0, 0);
+        for (k, p) in pts.iter().enumerate().take(j).skip(i + 1) {
+            let e = ZBox::lerp(a.1, b.1, (p.0 - a.0) / (b.0 - a.0).max(1e-9));
+            let d = (e.x - p.1.x).abs().max((e.y - p.1.y).abs());
+            if d > worst.0 {
+                worst = (d, k);
+            }
+        }
+        if worst.0 > tol {
+            keep[worst.1] = true;
+            stack.push((i, worst.1));
+            stack.push((worst.1, j));
+        }
+    }
+    pts.iter().zip(keep).filter(|x| x.1).map(|x| *x.0).collect()
+}
+
+/// A tracked zone's camera path: the target's centres, smoothed (separately
+/// between fixes, so a fix is never blurred away), as boxes of size `s`
+/// kept inside the frame, cut down to at most `max_keys` keyframes.
+pub fn track_path(points: &[Point], locks: &[Lock], smoothness: f64, s: f64, start: f64, end: f64, max_keys: usize) -> Vec<(f64, ZBox)> {
+    let pts: Vec<Point> = points.iter().copied().filter(|p| p.t >= start - 1e-6 && p.t <= end + 1e-6).collect();
+    if pts.is_empty() {
+        return Vec::new();
+    }
+    let sigma = smoothness.clamp(0.0, 1.0) * 0.8;
+    let mut cuts: Vec<f64> = locks.iter().map(|l| l.t).filter(|&t| t > start && t < end).collect();
+    cuts.sort_by(f64::total_cmp);
+    let mut smoothed = Vec::new();
+    let mut from = 0;
+    for c in cuts.iter().copied().chain([f64::INFINITY]) {
+        let to = pts.iter().position(|p| p.t >= c - 1e-6).unwrap_or(pts.len()).max(from);
+        smoothed.extend(smooth_points(&pts[from..to], sigma));
+        from = to;
+    }
+    let boxes: Vec<(f64, ZBox)> = smoothed.iter().map(|p| (p.t, ZBox { x: p.x - s / 2.0, y: p.y - s / 2.0, s }.clamped())).collect();
+    let mut tol = 0.002;
+    loop {
+        let out = simplify(&boxes, tol);
+        if out.len() <= max_keys.max(2) {
+            return out;
+        }
+        tol *= 1.5;
+    }
 }
 
 /// From `t0` to `t1` the view moves (eased) from `from` to `to`.
@@ -127,6 +257,8 @@ pub struct Seg {
     pub t1: f64,
     pub from: ZBox,
     pub to: ZBox,
+    /// Straight-line move (tracked paths) instead of slow-fast-slow.
+    pub linear: bool,
 }
 
 /// Two smooth zones close enough together glide straight from one box to
@@ -139,21 +271,33 @@ pub fn segments(zones: &[Resolved]) -> Vec<Seg> {
     let mut zs = zones.to_vec();
     zs.sort_by(|a, b| a.start.total_cmp(&b.start));
     let mut out = Vec::new();
-    let mut push = |t0: f64, t1: f64, from: ZBox, to: ZBox| {
+    let mut push = |t0: f64, t1: f64, from: ZBox, to: ZBox, linear: bool| {
         if t1 > t0 + 1e-9 {
-            out.push(Seg { t0, t1, from, to });
+            out.push(Seg { t0, t1, from, to, linear });
         }
     };
     for (i, z) in zs.iter().enumerate() {
         let g = z.glide;
         let merged_in = i > 0 && merges(&zs[i - 1], z);
         if !merged_in {
-            push(z.start, z.start + g, ZBox::FULL, z.a);
+            push(z.start, z.start + g, ZBox::FULL, z.a, false);
         }
-        push(z.start + g, z.end - g, z.a, z.b);
+        match &z.path {
+            Some(path) => {
+                // Straight lines between the keyframes inside the glides.
+                let (t0, t1) = (z.start + g, z.end - g);
+                let mut keys: Vec<(f64, ZBox)> = vec![(t0, z.a)];
+                keys.extend(path.iter().copied().filter(|k| k.0 > t0 + 1e-6 && k.0 < t1 - 1e-6));
+                keys.push((t1, z.b));
+                for w in keys.windows(2) {
+                    push(w[0].0, w[1].0, w[0].1, w[1].1, true);
+                }
+            }
+            None => push(z.start + g, z.end - g, z.a, z.b, false),
+        }
         match zs.get(i + 1) {
-            Some(next) if merges(z, next) => push(z.end - g, next.start + next.glide, z.b, next.a),
-            _ => push(z.end - g, z.end, z.b, ZBox::FULL),
+            Some(next) if merges(z, next) => push(z.end - g, next.start + next.glide, z.b, next.a, false),
+            _ => push(z.end - g, z.end, z.b, ZBox::FULL, false),
         }
     }
     out
@@ -169,7 +313,8 @@ fn ease(p: f64) -> f64 {
 pub fn sample(segs: &[Seg], t: f64) -> ZBox {
     for s in segs {
         if t >= s.t0 && t < s.t1 {
-            return ZBox::lerp(s.from, s.to, ease((t - s.t0) / (s.t1 - s.t0)));
+            let p = (t - s.t0) / (s.t1 - s.t0);
+            return ZBox::lerp(s.from, s.to, if s.linear { p.clamp(0.0, 1.0) } else { ease(p) });
         }
     }
     ZBox::FULL
@@ -210,6 +355,8 @@ fn expr(segs: &[Seg], c: Comp, tv: &str, offset: f64) -> String {
         let (f, d) = (comp(s.from, c), comp(s.to, c) - comp(s.from, c));
         let value = if d.abs() < 1e-9 {
             num(f)
+        } else if s.linear {
+            format!("{}+{}*(({tv}-{})/{})", num(f), num(d), num(t0), num(t1 - t0))
         } else {
             let p = format!("(({tv}-{})/{})", num(t0), num(t1 - t0));
             format!("{}+{}*{p}*{p}*(3-2*{p})", num(f), num(d))
@@ -336,6 +483,9 @@ pub fn check(zones: &[Zone], trim: Option<(f64, f64)>) -> Vec<ZoneProblem> {
             p(format!("Zone {n}: start must be before end."), vec![ZoneFix::Delete(i)]);
             continue;
         }
+        if z.track && z.a_drawn && z.track_points.is_empty() {
+            p(format!("Zone {n} is set to Track but hasn't been tracked yet. Click Track."), vec![]);
+        }
         if !z.a_drawn {
             p(format!("Zone {n} has no box yet. Click Draw box, then drag on the video."), vec![ZoneFix::Delete(i)]);
         } else if z.pan && !z.b_drawn {
@@ -392,8 +542,39 @@ mod tests {
     use super::*;
 
     fn r(start: f64, end: f64, glide: f64, a: ZBox, b: ZBox) -> Resolved {
-        Resolved { start, end, glide, a, b }
+        Resolved { start, end, glide, a, b, path: None }
     }
+
+    #[test]
+    fn tracked_path_is_smoothed_simplified_and_matches_ffmpeg() {
+        // A target moving right at a steady pace, with a little jitter.
+        let pts: Vec<Point> = (0..=90).map(|k| {
+            let t = 10.0 + k as f64 / 30.0;
+            Point { t, x: 0.2 + 0.1 * (t - 10.0) + if k % 2 == 0 { 0.004 } else { -0.004 }, y: 0.5 }
+        }).collect();
+        let path = track_path(&pts, &[], 0.5, 0.4, 10.0, 13.0, MAX_TRACK_KEYS);
+        assert!(path.len() <= 10, "a steady move needs few keyframes: {}", path.len());
+        // Centre follows the target; the box keeps its size and stays inside.
+        let mid = box_at(&path, 11.5);
+        assert!((mid.x + 0.2 - 0.35).abs() < 0.02, "{mid:?}");
+        assert_eq!(mid.s, 0.4);
+        let zone = Resolved { start: 10.0, end: 13.0, glide: 0.3, a: box_at(&path, 10.3), b: box_at(&path, 12.7), path: Some(Arc::new(path)) };
+        let segs = segments(&[zone]);
+        assert!(segs.iter().any(|s| s.linear));
+        for c in [Comp::X, Comp::Y, Comp::S] {
+            let e = expr(&segs, c, "it", 9.0);
+            let mut t = 0.0;
+            while t < 5.0 {
+                let want = comp(sample(&segs, t + 9.0), c);
+                assert!((want - eval(&e, t)).abs() < 1e-3, "t={t}");
+                t += 0.03;
+            }
+        }
+        // Lots of wobble with no smoothing still stays under the keyframe cap.
+        let wild: Vec<Point> = (0..600).map(|k| Point { t: k as f64 / 30.0, x: 0.5 + 0.2 * ((k * 7919) % 13) as f64 / 13.0 - 0.1, y: 0.5 }).collect();
+        assert!(track_path(&wild, &[], 0.0, 0.3, 0.0, 20.0, MAX_TRACK_KEYS).len() <= MAX_TRACK_KEYS);
+    }
+
     fn close(a: ZBox, b: ZBox) -> bool {
         (a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6 && (a.s - b.s).abs() < 1e-6
     }
@@ -632,5 +813,11 @@ mod tests {
         hard.smooth = false;
         assert_eq!(check(&[hard], None).len(), 1);
         assert_eq!(check(&[zone("x", "2")], None)[0].fixes, vec![]);
+    }
+}
+
+impl Default for Zone {
+    fn default() -> Self {
+        Zone::new(0.0, 0.0)
     }
 }

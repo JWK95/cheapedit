@@ -30,73 +30,114 @@ pub struct Export {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// One FFmpeg run of an export. `total` is how many seconds it writes (for progress).
+pub struct Step {
+    pub args: Vec<String>,
+    pub total: f64,
+}
+
 impl Export {
     /// Start FFmpeg. `total` is the expected output length in seconds.
     pub fn start(ffmpeg: &Path, args: Vec<String>, output: PathBuf, total: f64, log: Log, ctx: eframe::egui::Context) -> Result<Export, String> {
-        log.push(Kind::Command, format!("{} {}", quote(&ffmpeg.to_string_lossy()), args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")));
-        let mut child = crate::winutil::hidden_command(ffmpeg)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Couldn't start FFmpeg: {e}"))?;
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        Export::start_steps(ffmpeg, vec![Step { args, total }], output, Vec::new(), log, ctx)
+    }
+
+    /// Run several FFmpeg commands one after another (a montage: each clip,
+    /// then the join), as one export with one progress bar. `temps` are
+    /// deleted at the end, whatever happens; `output` is deleted unless it
+    /// all worked.
+    pub fn start_steps(ffmpeg: &Path, steps: Vec<Step>, output: PathBuf, temps: Vec<PathBuf>, log: Log, ctx: eframe::egui::Context) -> Result<Export, String> {
+        if !crate::winutil::hidden_command(ffmpeg).arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()) {
+            return Err("Couldn't start FFmpeg.".into());
+        }
         let state = Arc::new(Mutex::new(Progress::default()));
-        let child = Arc::new(Mutex::new(Some(child)));
+        let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // stderr: warnings and errors, kept for the log and the error message.
-        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
-        let err_thread = {
-            let errors = errors.clone();
-            let log = log.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    if !line.trim().is_empty() {
-                        log.push(Kind::Output, line.clone());
-                        errors.lock().unwrap().push(line);
-                    }
-                }
-            })
-        };
-
         {
-            let (state, child, cancelled, output) = (state.clone(), child.clone(), cancelled.clone(), output.clone());
+            let (state, child, cancelled, output, ffmpeg) = (state.clone(), child.clone(), cancelled.clone(), output.clone(), ffmpeg.to_path_buf());
             std::thread::spawn(move || {
                 let began = Instant::now();
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    // "-progress" writes key=value lines; out_time_us is microseconds written so far.
-                    if let Some(v) = line.strip_prefix("out_time_us=").or_else(|| line.strip_prefix("out_time_ms=")) {
-                        if let Ok(us) = v.trim().parse::<f64>() {
-                            let f = if total > 0.0 { (us / 1e6 / total).clamp(0.0, 1.0) } else { 0.0 };
-                            let el = began.elapsed().as_secs_f64();
-                            let mut s = state.lock().unwrap();
-                            s.fraction = f as f32;
-                            s.eta = (f > 0.02).then(|| el * (1.0 - f) / f);
-                            drop(s);
-                            ctx.request_repaint();
+                let all: f64 = steps.iter().map(|s| s.total.max(0.0)).sum::<f64>().max(0.001);
+                let mut done_before = 0.0;
+                let mut outcome = Outcome::Done;
+                let n = steps.len();
+                for (k, step) in steps.into_iter().enumerate() {
+                    if n > 1 {
+                        log.info(format!("Step {} of {n}", k + 1));
+                    }
+                    log.push(Kind::Command, format!("{} {}", quote(&ffmpeg.to_string_lossy()), step.args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")));
+                    let spawned = crate::winutil::hidden_command(&ffmpeg).args(&step.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+                    let mut c = match spawned {
+                        Ok(c) => c,
+                        Err(e) => {
+                            outcome = Outcome::Failed(format!("Couldn't start FFmpeg: {e}"));
+                            break;
+                        }
+                    };
+                    let stdout = c.stdout.take().unwrap();
+                    let stderr = c.stderr.take().unwrap();
+                    *child.lock().unwrap() = Some(c);
+                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Some(c) = child.lock().unwrap().as_mut() {
+                            let _ = c.kill();
                         }
                     }
+                    // stderr: warnings and errors, kept for the log and the error message.
+                    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+                    let err_thread = {
+                        let (errors, log) = (errors.clone(), log.clone());
+                        std::thread::spawn(move || {
+                            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                                if !line.trim().is_empty() {
+                                    log.push(Kind::Output, line.clone());
+                                    errors.lock().unwrap().push(line);
+                                }
+                            }
+                        })
+                    };
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        // "-progress" writes key=value lines; out_time_us is microseconds written so far.
+                        if let Some(v) = line.strip_prefix("out_time_us=").or_else(|| line.strip_prefix("out_time_ms=")) {
+                            if let Ok(us) = v.trim().parse::<f64>() {
+                                let here = (us / 1e6).clamp(0.0, step.total.max(0.0));
+                                let f = ((done_before + here) / all).clamp(0.0, 1.0);
+                                let el = began.elapsed().as_secs_f64();
+                                let mut s = state.lock().unwrap();
+                                s.fraction = f as f32;
+                                s.eta = (f > 0.02).then(|| el * (1.0 - f) / f);
+                                drop(s);
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                    let _ = err_thread.join();
+                    let status = child.lock().unwrap().take().and_then(|mut c| c.wait().ok());
+                    if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                        outcome = Outcome::Cancelled;
+                        break;
+                    }
+                    if !status.map(|s| s.success()).unwrap_or(false) {
+                        let msg = explain(&errors.lock().unwrap());
+                        log.error(&msg);
+                        outcome = Outcome::Failed(msg);
+                        break;
+                    }
+                    done_before += step.total.max(0.0);
                 }
-                let _ = err_thread.join();
-                let status = child.lock().unwrap().take().and_then(|mut c| c.wait().ok());
-                let outcome = if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                    let _ = std::fs::remove_file(&output);
-                    log.info("Export cancelled; partial file deleted.");
-                    Outcome::Cancelled
-                } else if status.map(|s| s.success()).unwrap_or(false) {
-                    log.info(format!("Saved {}", output.display()));
-                    Outcome::Done
-                } else {
-                    let lines = errors.lock().unwrap().clone();
-                    let msg = explain(&lines);
-                    // Never leave a broken half-file behind. (`-n` means it can't be someone else's file.)
-                    let _ = std::fs::remove_file(&output);
-                    log.error(&msg);
-                    Outcome::Failed(msg)
-                };
+                for t in &temps {
+                    let _ = std::fs::remove_file(t);
+                }
+                match &outcome {
+                    Outcome::Done => log.info(format!("Saved {}", output.display())),
+                    Outcome::Cancelled => {
+                        // Never leave a broken half-file behind. (`-n` means it can't be someone else's file.)
+                        let _ = std::fs::remove_file(&output);
+                        log.info("Export cancelled; partial file deleted.");
+                    }
+                    Outcome::Failed(_) => {
+                        let _ = std::fs::remove_file(&output);
+                    }
+                }
                 let mut s = state.lock().unwrap();
                 if outcome == Outcome::Done {
                     s.fraction = 1.0;

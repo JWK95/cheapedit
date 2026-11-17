@@ -1,4 +1,5 @@
-# Download and lay out the FFmpeg and libmpv builds cheapedit bundles.
+# Download and lay out the FFmpeg and libmpv builds cheapedit bundles, plus
+# ONNX Runtime, DirectML and the VitTrack model for tracked zoom zones.
 #
 #   .\tools\fetch-deps.ps1         download (once, into target\deps-cache), check
 #                                  every SHA-256 against tools\deps.toml, and build
@@ -85,6 +86,10 @@ $ffZip = Get-Pinned 'ffmpeg' 'url' 'sha256'
 $ffSrc = Get-Pinned 'ffmpeg' 'source_url' 'source_sha256' $deps['ffmpeg']['source_name']
 $mpv7z = Get-Pinned 'libmpv' 'url' 'sha256'
 $mpvSrc = Get-Pinned 'libmpv' 'source_url' 'source_sha256' $deps['libmpv']['source_name']
+$ortPkg = Get-Pinned 'onnxruntime' 'url' 'sha256' 'onnxruntime-directml.zip'
+$dmlPkg = Get-Pinned 'directml' 'url' 'sha256' 'directml.zip'
+$vitModel = Get-Pinned 'vittrack' 'url' 'sha256' 'vittrack.onnx'
+$vitLicense = Get-Pinned 'vittrack' 'license_url' 'license_sha256' 'vittrack-LICENSE.txt'
 if ($Pin) { $deps = Read-Deps; Write-Host "`nNew pins written to $tomlPath." }
 
 Step "Unpacking"
@@ -92,6 +97,8 @@ $work = Join-Path $cache 'unpacked'
 if (Test-Path $work) { Remove-Item $work -Recurse -Force }
 Expand $ffZip "$work\ffmpeg"
 Expand $mpv7z "$work\mpv"
+Expand $ortPkg "$work\ort"
+Expand $dmlPkg "$work\dml"
 # mpv's licence files come from its source archive.
 New-Item -ItemType Directory -Force "$work\mpvsrc" | Out-Null
 & "$env:SystemRoot\System32\tar.exe" -xzf $mpvSrc -C "$work\mpvsrc" --strip-components 1 '*/LICENSE.GPL' '*/LICENSE.LGPL' '*/Copyright' 2>$null
@@ -109,20 +116,41 @@ $dll = Get-ChildItem "$work\mpv" -Recurse -Filter 'libmpv-2.dll' | Select-Object
 if (-not $dll) { Fail "No libmpv-2.dll in the mpv archive." }
 Copy-Item $dll.FullName $out
 foreach ($f in 'LICENSE.GPL', 'LICENSE.LGPL', 'Copyright') { if (Test-Path "$work\mpvsrc\$f") { Copy-Item "$work\mpvsrc\$f" "$out\licenses\mpv-$f" } }
-foreach ($need in 'ffmpeg.exe', 'ffprobe.exe', 'libmpv-2.dll') { if (-not (Test-Path "$out\$need")) { Fail "$need is missing from $out" } }
+# Tracking: ONNX Runtime (DirectML build), DirectML and the model.
+foreach ($f in 'onnxruntime.dll', 'onnxruntime_providers_shared.dll') {
+    $x = Get-ChildItem "$work\ort\runtimes\win-x64\native" -Filter $f -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($x) { Copy-Item $x.FullName $out }
+}
+$x = Get-ChildItem "$work\dml\bin\x64-win" -Filter 'DirectML.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $x) { Fail "No x64 DirectML.dll in the DirectML package." }
+Copy-Item $x.FullName $out
+New-Item -ItemType Directory -Force "$out\models" | Out-Null
+Copy-Item $vitModel "$out\models\vittrack.onnx"
+foreach ($f in 'LICENSE', 'ThirdPartyNotices.txt') { if (Test-Path "$work\ort\$f") { Copy-Item "$work\ort\$f" "$out\licenses\onnxruntime-$f" } }
+foreach ($f in 'LICENSE.txt', 'LICENSE-CODE.txt', 'ThirdPartyNotices.txt') { if (Test-Path "$work\dml\$f") { Copy-Item "$work\dml\$f" "$out\licenses\DirectML-$f" } }
+Copy-Item $vitLicense "$out\licenses\VitTrack-LICENSE.txt"
+foreach ($need in 'ffmpeg.exe', 'ffprobe.exe', 'libmpv-2.dll', 'onnxruntime.dll', 'DirectML.dll', 'models\vittrack.onnx') { if (-not (Test-Path "$out\$need")) { Fail "$need is missing from $out" } }
 
-$ff = $deps['ffmpeg']; $mpv = $deps['libmpv']
+$ff = $deps['ffmpeg']; $mpv = $deps['libmpv']; $ort = $deps['onnxruntime']; $dml = $deps['directml']; $vit = $deps['vittrack']
 $versions = @"
 FFmpeg $($ff['version']) ($($ff['build']))
 libmpv $($mpv['version']) ($($mpv['build']))
+ONNX Runtime $($ort['version']) ($($ort['build']))
+DirectML $($dml['version']) ($($dml['build']))
+VitTrack $($vit['version']) ($($vit['build']))
 "@
 [IO.File]::WriteAllText("$PWD\$out\VERSIONS.txt", $versions)
 $readme = @"
-cheapedit bundles these programs. Both are free software under the GNU GPL.
+cheapedit bundles these programs. FFmpeg and mpv are free software under
+the GNU GPL. ONNX Runtime (MIT), DirectML (Microsoft's redistributable
+licence) and the VitTrack model (Apache 2.0) are used for tracked zoom zones.
 
 $versions
 FFmpeg: https://ffmpeg.org (licence: FFmpeg-LICENSE)
 mpv:    https://mpv.io (licence: mpv-Copyright, mpv-LICENSE.GPL)
+ONNX Runtime: https://onnxruntime.ai (licence: onnxruntime-LICENSE)
+DirectML: https://github.com/microsoft/DirectML (licence: DirectML-LICENSE.txt)
+VitTrack: https://github.com/opencv/opencv_zoo (licence: VitTrack-LICENSE.txt)
 
 The exact source code for these builds is attached to every cheapedit
 release on GitHub (https://github.com/JWK95/cheapedit/releases), as

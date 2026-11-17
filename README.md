@@ -3,8 +3,11 @@
 A lightweight Windows front end for FFmpeg. You can:
 
 - trim a clip between two timestamps
-- zoom into part of the picture for a stretch of time, with smooth glides and pans (up to 20 zones)
-- change its speed
+- zoom into part of the picture for a stretch of time, with smooth glides and pans (up to 20 zones), or have the zoom **follow** something moving, like a player
+- slow motion and fast forward for any part of the clip, with the timeline stretching to show the new length
+- put pictures, GIFs, videos and text on top, and glide them across the frame
+- search KLIPY for a GIF with your own free key and drop it straight on the clip
+- **Montage mode:** edit clip after clip, then join them all into one file
 - keep, mute or remove the audio, or export the audio alone as an MP3
 - pick the format, codec and quality
 
@@ -28,7 +31,7 @@ cheapedit isn't code-signed yet. A signing certificate costs money every year, s
 
 ## Privacy
 
-The only time cheapedit goes online is one update check when it starts. It asks github.com for the latest version number and sends nothing about you or your videos. You can turn it off under **About**. cheapedit doesn't install anything else on your system and doesn't change any system settings. Its bundled FFmpeg and libmpv stay inside its own folder and are never added to PATH.
+cheapedit goes online in two cases only. One update check when it starts: it asks github.com for the latest version number and sends nothing about you or your videos (turn it off under **About**). And the KLIPY GIF search, only if you add your own KLIPY key and search: then your search words and your key go to KLIPY, and the GIFs you pick are downloaded into your Assets folder. cheapedit doesn't install anything else on your system and doesn't change any system settings. Its bundled FFmpeg and libmpv stay inside its own folder and are never added to PATH.
 
 ## Developing
 
@@ -53,7 +56,7 @@ This one command:
 
 1. Fetches and checks the pinned FFmpeg and libmpv.
 2. Runs the tests.
-3. Builds the exe, the installer (about 100 MB, with FFmpeg and libmpv inside) and its SHA-256 checksum.
+3. Builds the exe, the installer (with FFmpeg, libmpv and the tracking files inside) and its SHA-256 checksum.
 4. Commits, tags and pushes.
 5. Publishes a GitHub release, with the FFmpeg and mpv source archives attached.
 
@@ -75,4 +78,4 @@ cheapedit is free software: you can redistribute it and/or modify it under the t
 
 Copyright (C) 2026 JWK95
 
-cheapedit includes [FFmpeg](https://ffmpeg.org) (Gyan's builds) and [libmpv](https://mpv.io) (shinchiro's builds), both under the GNU GPL. Their licences are in the `deps\licenses` folder of an install, and the exact source code for the bundled builds is attached to every [release](https://github.com/JWK95/cheapedit/releases).
+cheapedit includes [FFmpeg](https://ffmpeg.org) (Gyan's builds) and [libmpv](https://mpv.io) (shinchiro's builds), both under the GNU GPL; the exact source code for the bundled builds is attached to every [release](https://github.com/JWK95/cheapedit/releases). For tracked zoom zones it also includes [ONNX Runtime](https://onnxruntime.ai) (MIT), Microsoft's [DirectML](https://github.com/microsoft/DirectML) (redistributable licence) and the VitTrack model from [OpenCV's model zoo](https://github.com/opencv/opencv_zoo) (Apache 2.0). All the licences are in the `deps\licenses` folder of an install.

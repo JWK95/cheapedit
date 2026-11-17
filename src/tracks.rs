@@ -5,7 +5,8 @@
 //! Pure (no I/O), so it can be unit-tested.
 
 /// One audio track's settings. Belongs to the open file, not saved.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TrackMix {
     /// Included in the preview and the export.
     pub on: bool,

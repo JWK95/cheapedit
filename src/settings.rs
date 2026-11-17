@@ -36,6 +36,14 @@ pub struct Settings {
     pub finished_show_audio: bool,
     /// Use the user's own FFmpeg and libmpv from PATH before the bundled ones.
     pub use_path_deps: bool,
+    /// GIFs, pictures and videos to put on clips (listed in Overlays).
+    pub assets_dir: Option<PathBuf>,
+    /// The user's own KLIPY API key (empty: no GIF search).
+    pub klipy_key: String,
+    /// Where montage projects are saved.
+    pub montage_dir: Option<PathBuf>,
+    /// Run tracking on the graphics card (DirectML) instead of the CPU.
+    pub tracker_gpu: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +65,10 @@ impl Default for Settings {
             editing_show_audio: true,
             finished_show_audio: true,
             use_path_deps: false,
+            assets_dir: None,
+            klipy_key: String::new(),
+            montage_dir: None,
+            tracker_gpu: false,
         }
     }
 }

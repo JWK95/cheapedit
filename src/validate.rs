@@ -15,6 +15,8 @@ pub enum Fix {
     ChooseFolder,
     SwitchToMkv,
     Zone(ZoneFix),
+    Speed(crate::speed::SpeedFix),
+    Overlay(crate::overlay::OverlayFix),
 }
 
 impl Fix {
@@ -25,6 +27,8 @@ impl Fix {
             Fix::ChooseFolder => "Choose folder".into(),
             Fix::SwitchToMkv => "Switch to MKV".into(),
             Fix::Zone(z) => z.label(),
+            Fix::Speed(z) => z.label(),
+            Fix::Overlay(z) => z.label(),
         }
     }
 }
@@ -51,6 +55,9 @@ pub struct Input<'a> {
     pub space: Option<(u64, u64)>,
     pub dir_writable: bool,
     pub zones: &'a [Zone],
+    pub speed_zones: &'a [crate::speed::SpeedZone],
+    /// Overlays (pass none when they don't apply: Fast mode is reported here).
+    pub overlays: &'a [crate::overlay::Overlay],
 }
 
 /// The trim range in seconds, if the boxes make sense.
@@ -129,6 +136,34 @@ pub fn check(i: &Input) -> Vec<Problem> {
             for z in zoom::check(i.zones, trim) {
                 out.push(Problem { message: z.message, fixes: z.fixes.into_iter().map(Fix::Zone).collect() });
             }
+            // Windows limits a command line to 32,767 characters.
+            let resolved: Vec<zoom::Resolved> = i.zones.iter().filter_map(Zone::resolve).collect();
+            if zoom::zoompan(&resolved, 0.0, 1920, 1080, 60.0).is_some_and(|f| f.len() > 24_000) {
+                out.push(p("The tracked zones move around too much to fit in one export. Raise their Smoothness, or use fewer tracked zones.", None));
+            }
+        }
+    }
+
+    // Speed zones (Fast mode copies the clip untouched, so they're off there).
+    if !i.speed_zones.is_empty() {
+        if o.mode == CutMode::Fast {
+            out.push(p("Speed zones need Precise mode — Fast mode copies the clip untouched.", Some(Fix::SwitchToPrecise)));
+        } else {
+            let trim = trim_range(media, i.start_text, i.end_text, i.until_end).ok();
+            for z in crate::speed::check(i.speed_zones, trim) {
+                out.push(Problem { message: z.message, fixes: z.fixes.into_iter().map(Fix::Speed).collect() });
+            }
+        }
+    }
+
+    if !i.overlays.is_empty() && o.av != AvMode::AudioOnly && media.video.is_some() {
+        if o.mode == CutMode::Fast {
+            out.push(p("Overlays need Precise mode — Fast mode copies the video untouched.", Some(Fix::SwitchToPrecise)));
+        } else {
+            let trim = trim_range(media, i.start_text, i.end_text, i.until_end).ok();
+            for z in crate::overlay::check(i.overlays, trim) {
+                out.push(Problem { message: z.message, fixes: z.fixes.into_iter().map(Fix::Overlay).collect() });
+            }
         }
     }
 
@@ -177,6 +212,8 @@ mod tests {
             space: Some((1_000, 10_000_000_000)),
             dir_writable: true,
             zones: &[],
+            speed_zones: &[],
+            overlays: &[],
         })
     }
 

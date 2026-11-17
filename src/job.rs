@@ -164,7 +164,6 @@ impl FrameRate {
 #[serde(default)]
 pub struct Options {
     pub mode: CutMode,
-    pub speed: f64,
     pub change_pitch: bool,
     pub av: AvMode,
     pub volume_pct: u32,
@@ -188,7 +187,6 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             mode: CutMode::Precise,
-            speed: 1.0,
             change_pitch: false,
             av: AvMode::Both,
             volume_pct: 100,
@@ -211,9 +209,6 @@ impl Default for Options {
 impl Options {
     pub fn output_container(&self) -> Container {
         if self.av == AvMode::AudioOnly { Container::Mp3 } else { self.container }
-    }
-    pub fn effective_speed(&self) -> f64 {
-        if self.mode == CutMode::Fast { 1.0 } else { self.speed }
     }
 
     /// These options with a Discord preset's fixed choices applied: Precise,
@@ -260,11 +255,35 @@ pub struct Job<'a> {
     /// Per-track settings when the source has several audio tracks
     /// (empty or one entry: just the first track, as before).
     pub tracks: &'a [crate::tracks::TrackMix],
+    /// Speed zones (times on the original video). Ignored in Fast mode.
+    pub speed_zones: &'a [crate::speed::Resolved],
+    /// Overlays, bottom layer first (times on the original video). Ignored
+    /// in Fast mode and without a picture.
+    pub overlays: &'a [crate::overlay::Overlay],
+    /// One clip of a montage: fit into this frame (black bars, never
+    /// stretched) at this frame rate, with 48 kHz stereo sound (silent if the
+    /// clip has none), so every clip can be joined without re-encoding.
+    pub montage: Option<Frame>,
+}
+
+/// A montage's picture size and frame rate.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Frame {
+    pub w: u32,
+    pub h: u32,
+    pub fps: f64,
+}
+
+impl Job<'_> {
+    /// The speed zones that apply (none in Fast mode, which copies untouched).
+    fn speeds(&self) -> &[crate::speed::Resolved] {
+        if self.opts.mode == CutMode::Fast { &[] } else { self.speed_zones }
+    }
 }
 
 /// Length of the exported clip in seconds.
-pub fn output_duration(start: f64, end: f64, speed: f64) -> f64 {
-    ((end - start) / speed).max(0.0)
+pub fn output_duration(start: f64, end: f64, zones: &[crate::speed::Resolved]) -> f64 {
+    crate::speed::TimeMap::new(zones).out_len(start, end)
 }
 
 fn n(v: f64) -> String {
@@ -273,41 +292,77 @@ fn n(v: f64) -> String {
     if s.is_empty() { "0".into() } else { s.to_string() }
 }
 
-/// `atempo` only accepts 0.5–100, so slower speeds are chained (0.25 = 0.5 × 0.5).
-pub fn atempo_chain(speed: f64) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut r = speed;
-    while r < 0.5 {
-        out.push("atempo=0.5".to_string());
-        r /= 0.5;
-    }
-    out.push(format!("atempo={}", n(r)));
-    out
-}
-
 const TONEMAP: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv";
 
 pub fn build_args(j: &Job) -> Vec<String> {
     let o = j.opts;
     let m = j.media;
     let fast = o.mode == CutMode::Fast;
-    let speed = o.effective_speed();
+    let map = crate::speed::TimeMap::new(j.speeds());
+    let pieces = crate::speed::pieces(&map, j.start, j.end);
+    let retimed = pieces.iter().any(|p| p.speed != 1.0);
     let audio_only = o.av == AvMode::AudioOnly;
     let container = o.output_container();
     let has_v = m.video.is_some() && !audio_only;
     let source = export_audio_of(j);
+    let overlays: &[crate::overlay::Overlay] = if has_v && !fast { j.overlays } else { &[] };
+    // Each overlay's times on the export's clock: before the speed zones for
+    // "follow clip speed" videos, after them for everything else.
+    let clock = |ov: &crate::overlay::Overlay| -> (f64, f64) {
+        let (s, e) = ov.times().unwrap_or((j.start, j.start));
+        if ov.follows_speed() {
+            (s - j.start, e - j.start)
+        } else {
+            let base = map.to_out(j.start);
+            (map.to_out(s) - base, map.to_out(e) - base)
+        }
+    };
+    // Media overlays are extra inputs, numbered from 1.
+    let mut input_of: Vec<Option<usize>> = Vec::new();
+    let mut next_input = 1;
+    for ov in overlays {
+        if ov.kind == crate::overlay::Kind::Text {
+            input_of.push(None);
+        } else {
+            input_of.push(Some(next_input));
+            next_input += 1;
+        }
+    }
+    let overlay_sound = source.is_some() && overlays.iter().any(|ov| ov.sound());
+    let mut complex: Vec<String> = Vec::new();
 
     let mut a: Vec<String> = Vec::new();
     let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
     push(&["-hide_banner", "-nostdin", "-n", "-loglevel", "warning"]);
     push(&["-ss", &n(j.start), "-t", &n(j.end - j.start), "-i"]);
     a.push(m.path.to_string_lossy().into_owned());
+    if !overlays.is_empty() {
+        let fps = m.video.as_ref().map_or(30.0, |v| v.fps);
+        let longest = (j.end - j.start) / crate::speed::MIN_SPEED + 2.0;
+        for ov in overlays.iter().filter(|ov| ov.kind != crate::overlay::Kind::Text) {
+            a.extend(crate::overlay::input_args(ov, fps, longest));
+        }
+    }
+    // A montage clip is cut to a whole number of frames, and its sound to
+    // exactly the same length, so joined clips never drift out of sync.
+    let montage_len = j.montage.map(|fr| {
+        let frames = (map.out_len(j.start, j.end) * fr.fps).round().max(1.0);
+        (frames as u64, frames / fr.fps)
+    });
+    // A montage clip without sound gets a silent track, so every clip matches.
+    let silent_input = j.montage.is_some() && source.is_none();
+    if silent_input {
+        let len = n(montage_len.map_or(0.0, |m| m.1));
+        a.extend(["-f".into(), "lavfi".into(), "-t".into(), len, "-i".into(), "anullsrc=r=48000:cl=stereo".into()]);
+    }
+    let silent_index = 1 + overlays.iter().filter(|ov| ov.kind != crate::overlay::Kind::Text).count();
     if has_v {
-        a.extend(["-map".into(), "0:v:0".into()]);
+        a.extend(["-map".into(), if overlays.is_empty() { "0:v:0".into() } else { "[vout]".into() }]);
     }
     match &source {
-        Some(ExportAudio::Track(i)) => a.extend(["-map".into(), format!("0:a:{i}")]),
-        Some(ExportAudio::Mix(_)) => a.extend(["-map".into(), "[aout]".into()]),
+        Some(ExportAudio::Track(i)) if !overlay_sound => a.extend(["-map".into(), format!("0:a:{i}")]),
+        Some(_) => a.extend(["-map".into(), "[aout]".into()]),
+        None if silent_input => a.extend(["-map".into(), format!("{silent_index}:a")]),
         _ => {}
     }
 
@@ -320,32 +375,79 @@ pub fn build_args(j: &Job) -> Vec<String> {
                 a.extend(["-tag:v".into(), "hvc1".into()]);
             }
         } else {
-            let mut vf: Vec<String> = Vec::new();
+            let mut pre: Vec<String> = Vec::new();
             if v.hdr && j.can_tonemap {
-                vf.push(TONEMAP.into());
+                pre.push(TONEMAP.into());
             }
             // Zoom before speed, so zone times match the original video. The
             // fps filter first makes the frame rate constant, which zoompan needs.
             if let Some(z) = crate::zoom::zoompan(j.zones, j.start, v.width, v.height, v.fps) {
-                vf.push(format!("fps={}", n(v.fps)));
-                vf.push(z);
+                pre.push(format!("fps={}", n(v.fps)));
+                pre.push(z);
             }
-            if speed != 1.0 {
-                vf.push(format!("setpts=PTS/{}", n(speed)));
-            }
+            let speed = crate::speed::video_chain(&pieces, v.fps);
+            let mut post: Vec<String> = Vec::new();
             let target_fps = match o.fps {
                 FrameRate::Fps(f) => Some(f as f64),
-                FrameRate::Same if speed != 1.0 => Some(v.fps),
+                FrameRate::Same if retimed => Some(v.fps),
                 FrameRate::Same => None,
             };
-            if let Some(f) = target_fps {
-                vf.push(format!("fps={}", n(f)));
+            if let Some(fr) = j.montage {
+                let (w, h) = (fr.w, fr.h);
+                // Start the clock at 0, so the frame count below is exact.
+                post.push("setpts=PTS-STARTPTS".into());
+                post.push(format!("scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos"));
+                post.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"));
+                post.push("setsar=1".into());
+                post.push(format!("fps={}", n(fr.fps)));
+                // Hold the last frame if short, then cut to the exact frame count.
+                post.push("tpad=stop_mode=clone:stop_duration=1".into());
+                post.push(format!("trim=end_frame={}", montage_len.map_or(1, |m| m.0)));
+            } else {
+                if let Some(f) = target_fps {
+                    post.push(format!("fps={}", n(f)));
+                }
+                if let Some(h) = o.resolution.height() {
+                    post.push(format!("scale=-2:{h}:flags=lanczos"));
+                }
             }
-            if let Some(h) = o.resolution.height() {
-                vf.push(format!("scale=-2:{h}:flags=lanczos"));
+            post.push(if o.vcodec == VCodec::ProRes { "format=yuv422p10le".into() } else { "format=yuv420p".into() });
+            if overlays.is_empty() {
+                let vf: Vec<String> = pre.into_iter().chain(speed).chain(post).collect();
+                a.extend(["-vf".into(), vf.join(",")]);
+            } else {
+                // A filter graph: the picture runs through each stage, and
+                // each overlay is laid on top in turn.
+                let mut g = Chain { parts: &mut complex, cur: "0:v:0".into(), k: 0 };
+                if !pre.is_empty() {
+                    g.link("", &pre.join(","));
+                }
+                let order: Vec<usize> = (0..overlays.len())
+                    .filter(|&i| overlays[i].follows_speed())
+                    .chain([usize::MAX]) // the speed zones go here
+                    .chain((0..overlays.len()).filter(|&i| !overlays[i].follows_speed()))
+                    .collect();
+                for i in order {
+                    if i == usize::MAX {
+                        if let Some(chain) = &speed {
+                            g.link("", chain);
+                        }
+                        continue;
+                    }
+                    let ov = &overlays[i];
+                    let (t0, t1) = clock(ov);
+                    match input_of[i] {
+                        None => g.link("", &crate::overlay::drawtext(ov, t0, t1, v.height)),
+                        Some(input) => {
+                            let label = format!("ov{i}");
+                            g.parts.push(crate::overlay::media_filters(ov, input, &label, t0, t1, v.width, v.height));
+                            g.link(&format!("[{label}]"), &crate::overlay::overlay_filter(ov, t0, t1));
+                        }
+                    }
+                }
+                g.k = usize::MAX;
+                g.link("", &post.join(","));
             }
-            vf.push(if o.vcodec == VCodec::ProRes { "format=yuv422p10le".into() } else { "format=yuv420p".into() });
-            a.extend(["-vf".into(), vf.join(",")]);
             let enc = j.video_encoder.unwrap_or("libx264");
             a.extend(["-c:v".into(), enc.into()]);
             a.extend(video_quality_args(enc, o));
@@ -366,7 +468,7 @@ pub fn build_args(j: &Job) -> Vec<String> {
         };
         let track = m.audio_tracks.get(first).or(m.audio.as_ref()).unwrap();
         let src = &track.codec;
-        let mixing = matches!(source, ExportAudio::Mix(_));
+        let mixing = matches!(source, ExportAudio::Mix(_)) || overlay_sound;
         let mute = o.av == AvMode::Mute;
         let volume = if fast { 1.0 } else { o.volume_pct as f64 / 100.0 };
         let codec = if audio_only {
@@ -374,40 +476,110 @@ pub fn build_args(j: &Job) -> Vec<String> {
         } else if fast {
             if !mute && !mixing && container.can_copy_audio(src) {
                 a.extend(["-c:a".into(), "copy".into()]);
-                return finish(a, container, fast, j.output);
+                return finish(a, complex, container, fast, j.output);
             }
             ACodec::from_ffprobe(src).filter(|c| container.audio_codecs().contains(c) && *c != ACodec::Pcm).unwrap_or(container.default_audio())
         } else {
             o.acodec
         };
-        let mut af: Vec<String> = Vec::new();
-        if speed != 1.0 {
-            if o.change_pitch {
-                let sr = track.sample_rate;
-                af.push(format!("asetrate={},aresample={sr}", (sr as f64 * speed).round() as u32));
-            } else {
-                af.extend(atempo_chain(speed));
-            }
-        }
+        let speed = crate::speed::audio_chain(&pieces, o.change_pitch, track.sample_rate);
+        let mut level: Vec<String> = Vec::new();
         if mute {
-            af.push("volume=0".into());
+            level.push("volume=0".into());
         } else if volume != 1.0 {
-            af.push(format!("volume={}", n(volume)));
+            level.push(format!("volume={}", n(volume)));
         }
-        if let ExportAudio::Mix(mix) = source {
-            a.extend(["-filter_complex".into(), crate::tracks::ffmpeg_mix_graph(mix, &af)]);
-        } else if !af.is_empty() {
-            a.extend(["-af".into(), af.join(",")]);
+        if let Some((_, len)) = montage_len {
+            // Same length as the picture, to the sample.
+            level.push("aresample=48000".into());
+            level.push("apad".into());
+            level.push(format!("atrim=end_sample={}", (len * 48000.0).round() as u64));
+        }
+        if overlay_sound {
+            // Graph: source -> mix in "follow speed" sound -> speed -> mix in
+            // the other overlays' sound -> volume -> [aout].
+            let mut cur = match source {
+                ExportAudio::Track(i) => format!("0:a:{i}"),
+                ExportAudio::Mix(mix) => {
+                    complex.push(crate::tracks::ffmpeg_mix_graph(mix, &[]).replacen("[aout]", "[amain]", 1));
+                    "amain".into()
+                }
+                ExportAudio::None => unreachable!(),
+            };
+            let mix_in = |complex: &mut Vec<String>, cur: &mut String, follow: bool, tag: &str| {
+                let mut labels = Vec::new();
+                for (i, ov) in overlays.iter().enumerate().filter(|(_, ov)| ov.sound() && ov.follows_speed() == follow) {
+                    let (t0, t1) = clock(ov);
+                    let label = format!("oa{i}");
+                    complex.push(crate::overlay::audio_filters(ov, input_of[i].unwrap(), &label, t0, t1));
+                    labels.push(label);
+                }
+                if !labels.is_empty() {
+                    let ins: String = labels.iter().map(|l| format!("[{l}]")).collect();
+                    complex.push(format!("[{cur}]{ins}amix=inputs={}:duration=first:normalize=0[{tag}]", labels.len() + 1));
+                    *cur = tag.into();
+                }
+            };
+            mix_in(&mut complex, &mut cur, true, "af0");
+            if let Some(chain) = &speed {
+                complex.push(format!("[{cur}]{chain}[af1]"));
+                cur = "af1".into();
+            }
+            mix_in(&mut complex, &mut cur, false, "af2");
+            let tail = if level.is_empty() { "anull".to_string() } else { level.join(",") };
+            complex.push(format!("[{cur}]{tail}[aout]"));
+        } else {
+            let af: Vec<String> = speed.into_iter().chain(level).collect();
+            if let ExportAudio::Mix(mix) = source {
+                complex.push(crate::tracks::ffmpeg_mix_graph(mix, &af));
+            } else if !af.is_empty() {
+                a.extend(["-af".into(), af.join(",")]);
+            }
         }
         a.extend(["-c:a".into(), codec.encoder().into()]);
         if codec.has_bitrate() {
             let kbps = if audio_only { o.mp3_kbps } else { o.audio_kbps };
             a.extend(["-b:a".into(), format!("{kbps}k")]);
         }
+        if j.montage.is_some() {
+            a.extend(["-ar".into(), "48000".into(), "-ac".into(), "2".into()]);
+        }
+    } else if silent_input {
+        a.extend(["-c:a".into(), o.acodec.encoder().into()]);
+        if o.acodec.has_bitrate() {
+            a.extend(["-b:a".into(), format!("{}k", o.audio_kbps)]);
+        }
+        a.extend(["-ar".into(), "48000".into(), "-ac".into(), "2".into()]);
     } else {
         a.push("-an".into());
     }
-    finish(a, container, fast, j.output)
+    if !overlays.is_empty() || j.montage.is_some() {
+        // Looping overlay inputs run on; stop at the clip's own length.
+        a.extend(["-t".into(), n(montage_len.map_or_else(|| map.out_len(j.start, j.end), |m| m.1))]);
+    }
+    finish(a, complex, container, fast, j.output)
+}
+
+/// Builds a video filter graph one link at a time: each link takes the
+/// current picture (plus any `extra` inputs) and names its output.
+struct Chain<'a> {
+    parts: &'a mut Vec<String>,
+    cur: String,
+    /// The last link's number; usize::MAX makes the next output `[vout]`.
+    k: usize,
+}
+
+impl Chain<'_> {
+    fn link(&mut self, extra: &str, filters: &str) {
+        let next = if self.k == usize::MAX {
+            "vout".to_string()
+        } else {
+            self.k += 1;
+            format!("v{}", self.k)
+        };
+        self.parts.push(format!("[{}]{extra}{filters}[{next}]", self.cur));
+        self.cur = next;
+    }
 }
 
 /// The audio the export takes, or None for no audio track at all.
@@ -421,7 +593,10 @@ fn export_audio_of(j: &Job) -> Option<ExportAudio> {
     }
 }
 
-fn finish(mut a: Vec<String>, container: Container, fast: bool, output: &Path) -> Vec<String> {
+fn finish(mut a: Vec<String>, complex: Vec<String>, container: Container, fast: bool, output: &Path) -> Vec<String> {
+    if !complex.is_empty() {
+        a.extend(["-filter_complex".into(), complex.join(";")]);
+    }
     a.extend(["-map_metadata".into(), "0".into()]);
     if matches!(container, Container::Mp4 | Container::Mov) {
         a.extend(["-movflags".into(), "+faststart".into()]);
@@ -486,7 +661,7 @@ fn video_quality_args(enc: &str, o: &Options) -> Vec<String> {
 /// Rough output size in bytes, for the free-space check.
 pub fn estimate_bytes(j: &Job) -> u64 {
     let o = j.opts;
-    let dur = output_duration(j.start, j.end, o.effective_speed());
+    let dur = output_duration(j.start, j.end, j.speeds());
     let src_bps = j.media.bitrate.unwrap_or(8_000_000) as f64;
     let bps = if o.av == AvMode::AudioOnly {
         o.mp3_kbps as f64 * 1000.0
@@ -525,7 +700,7 @@ pub fn estimate(j: &Job) -> Estimate {
     let m = j.media;
     let fast = o.mode == CutMode::Fast;
     let audio_only = o.av == AvMode::AudioOnly || m.video.is_none();
-    let dur = output_duration(j.start, j.end, o.effective_speed()).max(0.001);
+    let dur = output_duration(j.start, j.end, j.speeds()).max(0.001);
     let bytes = estimate_bytes(j);
     let has_a = export_audio_of(j).is_some();
     let audio_kbps = if !has_a || o.av == AvMode::Mute && !audio_only {
@@ -617,6 +792,7 @@ pub fn unique_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::probe::{AudioInfo, VideoInfo};
+    use crate::speed::Resolved;
 
     fn media() -> MediaInfo {
         MediaInfo {
@@ -631,9 +807,18 @@ mod tests {
     }
 
     fn args(o: &Options, enc: Option<&'static str>) -> String {
+        args_speed(o, enc, &[])
+    }
+
+    fn whole(speed: f64) -> [Resolved; 1] {
+        [Resolved { start: 25.0, end: 45.0, speed, smooth: false, mute: false }]
+    }
+
+    /// The trim is 25-45 s.
+    fn args_speed(o: &Options, enc: Option<&'static str>, speed_zones: &[Resolved]) -> String {
         let m = media();
         let out = PathBuf::from("C:\\out\\x.mp4");
-        let j = Job { media: &m, opts: o, start: 25.0, end: 45.0, output: &out, video_encoder: enc, can_tonemap: true, zones: &[], tracks: &[] };
+        let j = Job { media: &m, opts: o, start: 25.0, end: 45.0, output: &out, video_encoder: enc, can_tonemap: true, zones: &[], tracks: &[], speed_zones, overlays: &[], montage: None };
         build_args(&j).join(" ")
     }
 
@@ -645,7 +830,7 @@ mod tests {
         m.audio_tracks.push(AudioInfo { codec: "aac".into(), sample_rate: 48000, channels: 1, title: Some("Mic".into()) });
         let out = PathBuf::from(r"C:\out\x.mp4");
         let run = |o: &Options, tracks: &[TrackMix]| {
-            build_args(&Job { media: &m, opts: o, start: 0.0, end: 5.0, output: &out, video_encoder: Some("libx264"), can_tonemap: true, zones: &[], tracks }).join(" ")
+            build_args(&Job { media: &m, opts: o, start: 0.0, end: 5.0, output: &out, video_encoder: Some("libx264"), can_tonemap: true, zones: &[], tracks, speed_zones: &[], overlays: &[], montage: None }).join(" ")
         };
         let both = [TrackMix::default(), TrackMix { volume_pct: 150, ..Default::default() }];
         let o = Options { volume_pct: 80, ..Options::default() };
@@ -682,8 +867,8 @@ mod tests {
 
     #[test]
     fn fast_copies() {
-        let o = Options { mode: CutMode::Fast, speed: 2.0, volume_pct: 50, ..Default::default() };
-        let a = args(&o, None);
+        let o = Options { mode: CutMode::Fast, volume_pct: 50, ..Default::default() };
+        let a = args_speed(&o, None, &whole(2.0));
         assert!(a.contains("-c:v copy"));
         assert!(a.contains("-c:a copy"));
         assert!(!a.contains("setpts"), "speed is ignored in fast mode");
@@ -692,12 +877,23 @@ mod tests {
 
     #[test]
     fn speed_and_pitch() {
-        let o = Options { speed: 0.25, ..Default::default() };
-        let a = args(&o, Some("libx264"));
+        let a = args_speed(&Options::default(), Some("libx264"), &whole(0.25));
         assert!(a.contains("setpts=PTS/0.25,fps=60"));
         assert!(a.contains("-af atempo=0.5,atempo=0.5"));
-        let o = Options { speed: 2.0, change_pitch: true, ..Default::default() };
-        assert!(args(&o, Some("libx264")).contains("asetrate=96000,aresample=48000"));
+        let o = Options { change_pitch: true, ..Default::default() };
+        assert!(args_speed(&o, Some("libx264"), &whole(2.0)).contains("asetrate=96000,aresample=48000"));
+    }
+
+    #[test]
+    fn speed_zone_pieces() {
+        // 30-32 s at half speed, muted; the rest normal.
+        let z = [Resolved { start: 30.0, end: 32.0, speed: 0.5, smooth: false, mute: true }];
+        let a = args_speed(&Options { volume_pct: 80, ..Default::default() }, Some("libx264"), &z);
+        assert!(a.contains("-vf split=3[vs0][vs1][vs2];[vs0]trim=start=0:end=5,"), "{a}");
+        assert!(a.contains("concat=n=3:v=1:a=0,fps=60,format=yuv420p"), "{a}");
+        assert!(a.contains("[as1]atrim=start=5:end=7,asetpts=PTS-STARTPTS,atempo=0.5,volume=0[ap1]"), "{a}");
+        assert!(a.contains("concat=n=3:v=0:a=1,volume=0.8 "), "{a}");
+        assert!((output_duration(25.0, 45.0, &z) - 22.0).abs() < 1e-9);
     }
 
     #[test]
@@ -726,9 +922,10 @@ mod tests {
         let m = media();
         let out = PathBuf::from("out.mp4");
         let bx = crate::zoom::ZBox::centered(0.5);
-        let zones = [crate::zoom::Resolved { start: 30.0, end: 35.0, glide: 0.5, a: bx, b: bx }];
-        let o = Options { speed: 2.0, ..Default::default() };
-        let j = Job { media: &m, opts: &o, start: 25.0, end: 45.0, output: &out, video_encoder: Some("libx264"), can_tonemap: true, zones: &zones, tracks: &[] };
+        let zones = [crate::zoom::Resolved { start: 30.0, end: 35.0, glide: 0.5, a: bx, b: bx, path: None }];
+        let o = Options::default();
+        let sz = whole(2.0);
+        let j = Job { media: &m, opts: &o, start: 25.0, end: 45.0, output: &out, video_encoder: Some("libx264"), can_tonemap: true, zones: &zones, tracks: &[], speed_zones: &sz, overlays: &[], montage: None };
         let a = build_args(&j).join(" ");
         let zp = a.find("fps=60,zoompan=").expect("zoompan present");
         assert!(zp < a.find("setpts=PTS/2").unwrap());
@@ -759,7 +956,7 @@ mod tests {
         let m = media();
         let out = PathBuf::from("x.mp4");
         let o = Options { resolution: Resolution::P720, fps: FrameRate::Fps(30), ..Default::default() };
-        let j = Job { media: &m, opts: &o, start: 0.0, end: 10.0, output: &out, video_encoder: None, can_tonemap: true, zones: &[], tracks: &[] };
+        let j = Job { media: &m, opts: &o, start: 0.0, end: 10.0, output: &out, video_encoder: None, can_tonemap: true, zones: &[], tracks: &[], speed_zones: &[], overlays: &[], montage: None };
         let e = estimate(&j);
         assert_eq!((e.size, e.fps, e.audio_kbps, e.exact_bitrate), (Some((1280, 720)), Some(30.0), Some(192), false));
         let o = Options { mode: CutMode::Fast, ..Default::default() };
@@ -769,6 +966,7 @@ mod tests {
 
     #[test]
     fn atempo_chains() {
+        use crate::speed::atempo_chain;
         assert_eq!(atempo_chain(2.0), vec!["atempo=2"]);
         assert_eq!(atempo_chain(0.3), vec!["atempo=0.5", "atempo=0.6"]);
     }
