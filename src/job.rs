@@ -5,6 +5,7 @@
 use crate::discord::{Plan, Preset};
 use crate::formats::{ACodec, Container, VCodec};
 use crate::probe::MediaInfo;
+use crate::tracks::ExportAudio;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -256,6 +257,9 @@ pub struct Job<'a> {
     pub can_tonemap: bool,
     /// Zoom zones (times on the original video). Ignored in Fast mode.
     pub zones: &'a [crate::zoom::Resolved],
+    /// Per-track settings when the source has several audio tracks
+    /// (empty or one entry: just the first track, as before).
+    pub tracks: &'a [crate::tracks::TrackMix],
 }
 
 /// Length of the exported clip in seconds.
@@ -291,7 +295,7 @@ pub fn build_args(j: &Job) -> Vec<String> {
     let audio_only = o.av == AvMode::AudioOnly;
     let container = o.output_container();
     let has_v = m.video.is_some() && !audio_only;
-    let has_a = m.audio.is_some() && o.av != AvMode::RemoveAudio;
+    let source = export_audio_of(j);
 
     let mut a: Vec<String> = Vec::new();
     let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
@@ -301,8 +305,10 @@ pub fn build_args(j: &Job) -> Vec<String> {
     if has_v {
         a.extend(["-map".into(), "0:v:0".into()]);
     }
-    if has_a {
-        a.extend(["-map".into(), "0:a:0".into()]);
+    match &source {
+        Some(ExportAudio::Track(i)) => a.extend(["-map".into(), format!("0:a:{i}")]),
+        Some(ExportAudio::Mix(_)) => a.extend(["-map".into(), "[aout]".into()]),
+        _ => {}
     }
 
     // ---- video ----
@@ -352,14 +358,21 @@ pub fn build_args(j: &Job) -> Vec<String> {
     }
 
     // ---- audio ----
-    if has_a {
-        let src = &m.audio.as_ref().unwrap().codec;
+    if let Some(source) = &source {
+        let first = match source {
+            ExportAudio::Track(i) => *i,
+            ExportAudio::Mix(mix) => mix[0].0,
+            ExportAudio::None => 0,
+        };
+        let track = m.audio_tracks.get(first).or(m.audio.as_ref()).unwrap();
+        let src = &track.codec;
+        let mixing = matches!(source, ExportAudio::Mix(_));
         let mute = o.av == AvMode::Mute;
         let volume = if fast { 1.0 } else { o.volume_pct as f64 / 100.0 };
         let codec = if audio_only {
             ACodec::Mp3
         } else if fast {
-            if !mute && container.can_copy_audio(src) {
+            if !mute && !mixing && container.can_copy_audio(src) {
                 a.extend(["-c:a".into(), "copy".into()]);
                 return finish(a, container, fast, j.output);
             }
@@ -370,7 +383,7 @@ pub fn build_args(j: &Job) -> Vec<String> {
         let mut af: Vec<String> = Vec::new();
         if speed != 1.0 {
             if o.change_pitch {
-                let sr = m.audio.as_ref().unwrap().sample_rate;
+                let sr = track.sample_rate;
                 af.push(format!("asetrate={},aresample={sr}", (sr as f64 * speed).round() as u32));
             } else {
                 af.extend(atempo_chain(speed));
@@ -381,7 +394,9 @@ pub fn build_args(j: &Job) -> Vec<String> {
         } else if volume != 1.0 {
             af.push(format!("volume={}", n(volume)));
         }
-        if !af.is_empty() {
+        if let ExportAudio::Mix(mix) = source {
+            a.extend(["-filter_complex".into(), crate::tracks::ffmpeg_mix_graph(mix, &af)]);
+        } else if !af.is_empty() {
             a.extend(["-af".into(), af.join(",")]);
         }
         a.extend(["-c:a".into(), codec.encoder().into()]);
@@ -393,6 +408,17 @@ pub fn build_args(j: &Job) -> Vec<String> {
         a.push("-an".into());
     }
     finish(a, container, fast, j.output)
+}
+
+/// The audio the export takes, or None for no audio track at all.
+fn export_audio_of(j: &Job) -> Option<ExportAudio> {
+    if j.media.audio.is_none() || j.opts.av == AvMode::RemoveAudio {
+        return None;
+    }
+    match crate::tracks::export_audio(j.tracks) {
+        ExportAudio::None => None,
+        other => Some(other),
+    }
 }
 
 fn finish(mut a: Vec<String>, container: Container, fast: bool, output: &Path) -> Vec<String> {
@@ -501,7 +527,7 @@ pub fn estimate(j: &Job) -> Estimate {
     let audio_only = o.av == AvMode::AudioOnly || m.video.is_none();
     let dur = output_duration(j.start, j.end, o.effective_speed()).max(0.001);
     let bytes = estimate_bytes(j);
-    let has_a = m.audio.is_some() && o.av != AvMode::RemoveAudio;
+    let has_a = export_audio_of(j).is_some();
     let audio_kbps = if !has_a || o.av == AvMode::Mute && !audio_only {
         // Muted audio is a silent track: next to nothing.
         None
@@ -599,15 +625,49 @@ mod tests {
             size_bytes: 60_000_000,
             bitrate: Some(8_000_000),
             video: Some(VideoInfo { codec: "h264".into(), width: 1920, height: 1080, fps: 60.0, hdr: false }),
-            audio: Some(AudioInfo { codec: "aac".into(), sample_rate: 48000, channels: 2 }),
+            audio: Some(AudioInfo { codec: "aac".into(), sample_rate: 48000, channels: 2, title: None }),
+            audio_tracks: vec![AudioInfo { codec: "aac".into(), sample_rate: 48000, channels: 2, title: None }],
         }
     }
 
     fn args(o: &Options, enc: Option<&'static str>) -> String {
         let m = media();
         let out = PathBuf::from("C:\\out\\x.mp4");
-        let j = Job { media: &m, opts: o, start: 25.0, end: 45.0, output: &out, video_encoder: enc, can_tonemap: true, zones: &[] };
+        let j = Job { media: &m, opts: o, start: 25.0, end: 45.0, output: &out, video_encoder: enc, can_tonemap: true, zones: &[], tracks: &[] };
         build_args(&j).join(" ")
+    }
+
+    /// Issue #6: game and mic on separate tracks.
+    #[test]
+    fn multi_track_audio() {
+        use crate::tracks::TrackMix;
+        let mut m = media();
+        m.audio_tracks.push(AudioInfo { codec: "aac".into(), sample_rate: 48000, channels: 1, title: Some("Mic".into()) });
+        let out = PathBuf::from(r"C:\out\x.mp4");
+        let run = |o: &Options, tracks: &[TrackMix]| {
+            build_args(&Job { media: &m, opts: o, start: 0.0, end: 5.0, output: &out, video_encoder: Some("libx264"), can_tonemap: true, zones: &[], tracks }).join(" ")
+        };
+        let both = [TrackMix::default(), TrackMix { volume_pct: 150, ..Default::default() }];
+        let o = Options { volume_pct: 80, ..Options::default() };
+        let a = run(&o, &both);
+        assert!(a.contains("-map [aout]"), "{a}");
+        assert!(a.contains("-filter_complex [0:a:0]volume=1[m0];[0:a:1]volume=1.5[m1];[m0][m1]amix=inputs=2:duration=longest:normalize=0,volume=0.8[aout]"), "{a}");
+        assert!(!a.contains("-af "), "{a}");
+
+        // Fast mode can't copy a mix, so the audio is encoded.
+        let fast = Options { mode: CutMode::Fast, ..Options::default() };
+        let a = run(&fast, &both);
+        assert!(a.contains("-c:v copy") && !a.contains("-c:a copy") && a.contains("amix"), "{a}");
+
+        // Just the mic, untouched: a plain stream that Fast mode can copy.
+        let mic_only = [TrackMix { on: false, ..Default::default() }, TrackMix::default()];
+        let a = run(&fast, &mic_only);
+        assert!(a.contains("-map 0:a:1") && a.contains("-c:a copy") && !a.contains("filter_complex"), "{a}");
+
+        // Everything off: no audio track.
+        let none = [TrackMix { on: false, ..Default::default() }; 2];
+        let a = run(&Options::default(), &none);
+        assert!(a.contains("-an") && !a.contains("0:a"), "{a}");
     }
 
     #[test]
@@ -668,7 +728,7 @@ mod tests {
         let bx = crate::zoom::ZBox::centered(0.5);
         let zones = [crate::zoom::Resolved { start: 30.0, end: 35.0, glide: 0.5, a: bx, b: bx }];
         let o = Options { speed: 2.0, ..Default::default() };
-        let j = Job { media: &m, opts: &o, start: 25.0, end: 45.0, output: &out, video_encoder: Some("libx264"), can_tonemap: true, zones: &zones };
+        let j = Job { media: &m, opts: &o, start: 25.0, end: 45.0, output: &out, video_encoder: Some("libx264"), can_tonemap: true, zones: &zones, tracks: &[] };
         let a = build_args(&j).join(" ");
         let zp = a.find("fps=60,zoompan=").expect("zoompan present");
         assert!(zp < a.find("setpts=PTS/2").unwrap());
@@ -699,7 +759,7 @@ mod tests {
         let m = media();
         let out = PathBuf::from("x.mp4");
         let o = Options { resolution: Resolution::P720, fps: FrameRate::Fps(30), ..Default::default() };
-        let j = Job { media: &m, opts: &o, start: 0.0, end: 10.0, output: &out, video_encoder: None, can_tonemap: true, zones: &[] };
+        let j = Job { media: &m, opts: &o, start: 0.0, end: 10.0, output: &out, video_encoder: None, can_tonemap: true, zones: &[], tracks: &[] };
         let e = estimate(&j);
         assert_eq!((e.size, e.fps, e.audio_kbps, e.exact_bitrate), (Some((1280, 720)), Some(30.0), Some(192), false));
         let o = Options { mode: CutMode::Fast, ..Default::default() };

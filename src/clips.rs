@@ -1,5 +1,5 @@
-//! The Clips drawer's data: every video under the user's clips folder,
-//! grouped by game, newest first.
+//! The Clips drawer's data: every video (and audio file) under the user's
+//! clips folder, grouped by game, newest first.
 //!
 //! The game comes from (in order): the folder the clip is in (ShadowPlay
 //! saves to `Videos\NVIDIA\<Game>\`), the text before the date in the file
@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-/// Video files the drawer lists (audio-only files are left out).
+/// Video files the drawer lists.
 pub const EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi", "m4v", "wmv", "flv", "ts", "mts", "m2ts"];
+/// Audio files the drawer lists too (each list has a checkbox to hide them).
+/// Includes MP3, cheapedit's own audio-only export.
+pub const AUDIO_EXTS: &[&str] = &["mp3", "m4a", "wav", "flac", "ogg", "opus"];
 
 pub const UNSORTED: &str = "Unsorted";
 
@@ -30,6 +33,8 @@ pub struct Clip {
     pub name: String,
     pub modified: SystemTime,
     pub size: u64,
+    /// An audio file rather than a video.
+    pub audio: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -107,8 +112,16 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
-fn is_video(p: &Path) -> bool {
-    p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).is_some_and(|e| EXTS.contains(&e.as_str()))
+/// `Some(false)` for a video, `Some(true)` for an audio file, `None` for anything else.
+fn media_kind(p: &Path) -> Option<bool> {
+    let e = p.extension()?.to_string_lossy().to_ascii_lowercase();
+    if EXTS.contains(&e.as_str()) {
+        Some(false)
+    } else if AUDIO_EXTS.contains(&e.as_str()) {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// How far to look.
@@ -135,9 +148,10 @@ fn walk(dir: &Path, depth: usize, opts: &ScanOpts, out: &mut Vec<Clip>) {
             if !opts.flat && depth < MAX_DEPTH && !hidden && !excluded {
                 walk(&path, depth + 1, opts, out);
             }
-        } else if ft.is_file() && is_video(&path) {
+        } else if let (true, Some(audio)) = (ft.is_file(), media_kind(&path)) {
             let Ok(md) = entry.metadata() else { continue };
             out.push(Clip {
+                audio,
                 name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
                 modified: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 size: md.len(),
@@ -307,7 +321,7 @@ mod tests {
     fn groups_newest_first() {
         let root = Path::new(r"C:\C");
         let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
-        let clip = |p: &str, s: u64| Clip { path: PathBuf::from(p), name: p.into(), modified: t(s), size: 1 };
+        let clip = |p: &str, s: u64| Clip { path: PathBuf::from(p), name: p.into(), modified: t(s), size: 1, audio: false };
         let g = group(
             root,
             vec![
@@ -320,6 +334,20 @@ mod tests {
         let names: Vec<_> = g.iter().map(|g| g.game.as_str()).collect();
         assert_eq!(names, ["B", "A", UNSORTED], "newest group first, Unsorted last, folder names merged ignoring case");
         assert_eq!(g[1].clips[0].modified, t(30));
+    }
+
+    /// Issue #5: audio-only (MP3) exports were missing from Finished files.
+    #[test]
+    fn scan_finds_audio_files() {
+        let dir = std::env::temp_dir().join(format!("cheapedit_scan_audio_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["clip.mp4", "voice.MP3", "notes.txt"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let mut found: Vec<(String, bool)> = scan(&dir, &ScanOpts { flat: true, exclude: None }).into_iter().flat_map(|g| g.clips).map(|c| (c.name, c.audio)).collect();
+        found.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found, [("clip.mp4".to_string(), false), ("voice.MP3".to_string(), true)]);
     }
 
     /// Prints how a real folder groups. Run with

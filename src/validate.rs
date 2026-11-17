@@ -159,7 +159,8 @@ mod tests {
             size_bytes: 1,
             bitrate: None,
             video: Some(VideoInfo { codec: codec.into(), width: 1920, height: 1080, fps: 30.0, hdr: false }),
-            audio: Some(AudioInfo { codec: "aac".into(), sample_rate: 48000, channels: 2 }),
+            audio: Some(AudioInfo { codec: "aac".into(), sample_rate: 48000, channels: 2, title: None }),
+            audio_tracks: vec![AudioInfo { codec: "aac".into(), sample_rate: 48000, channels: 2, title: None }],
         }
     }
 

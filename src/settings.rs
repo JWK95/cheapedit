@@ -20,6 +20,8 @@ pub struct Settings {
     pub preview_volume: u32,
     /// Show the ghost line where playback last started.
     pub show_ghost: bool,
+    /// Draw the audio's waveform in the timeline.
+    pub show_waveform: bool,
     /// The folder the Clips drawer lists.
     pub clips_dir: Option<PathBuf>,
     /// The Clips drawer is open.
@@ -28,6 +30,10 @@ pub struct Settings {
     pub clips_width: f32,
     /// Where the drawer's divider sits: the Editing half's share of the height.
     pub clips_split: f32,
+    /// List audio files in the drawer's Editing half.
+    pub editing_show_audio: bool,
+    /// List audio files (like MP3 exports) in the drawer's Finished half.
+    pub finished_show_audio: bool,
     /// Use the user's own FFmpeg and libmpv from PATH before the bundled ones.
     pub use_path_deps: bool,
 }
@@ -43,10 +49,13 @@ impl Default for Settings {
             zoom_static_preview: false,
             preview_volume: 100,
             show_ghost: true,
+            show_waveform: true,
             clips_dir: None,
             clips_open: true,
             clips_width: 250.0,
             clips_split: 0.5,
+            editing_show_audio: true,
+            finished_show_audio: true,
             use_path_deps: false,
         }
     }

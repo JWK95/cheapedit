@@ -36,7 +36,7 @@ fn run_case(ffmpeg: &Path, ffprobe: &Path, caps: &Caps, src: &probe::MediaInfo, 
     let _ = std::fs::remove_file(&out);
     let enc = if o.mode == CutMode::Precise && o.av != AvMode::AudioOnly { caps.pick(o.vcodec, o.use_gpu) } else { None };
     let (start, end) = (1.0, 3.0);
-    let job = Job { media: src, opts: o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &[] };
+    let job = Job { media: src, opts: o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &[], tracks: &[] };
     let args = build_args(&job);
     let res = crate::winutil::hidden_command(ffmpeg).args(&args).output().map_err(|e| e.to_string())?;
     if !res.status.success() {
@@ -160,7 +160,7 @@ fn zoom_zones_export() {
         let out = dir.join(format!("zoom{speed}.mp4"));
         let _ = std::fs::remove_file(&out);
         let enc = caps.pick(o.vcodec, o.use_gpu);
-        let job = Job { media: &src, opts: &o, start: 1.0, end: 3.0, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &zones };
+        let job = Job { media: &src, opts: &o, start: 1.0, end: 3.0, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &zones, tracks: &[] };
         let args = build_args(&job);
         let res = crate::winutil::hidden_command(&ffmpeg).args(&args).output().unwrap();
         assert!(res.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&res.stderr));
@@ -209,7 +209,7 @@ fn discord_presets_fit() {
             }
             let out = dir.join(format!("d_{}_{secs}_{enc}.mp4", preset.cap_mb().unwrap()));
             let _ = std::fs::remove_file(&out);
-            let job = Job { media: &m, opts: &o, start: 0.5, end: 0.5 + secs, output: &out, video_encoder: Some(enc), can_tonemap: caps.zscale, zones: &[] };
+            let job = Job { media: &m, opts: &o, start: 0.5, end: 0.5 + secs, output: &out, video_encoder: Some(enc), can_tonemap: caps.zscale, zones: &[], tracks: &[] };
             let res = crate::winutil::hidden_command(&ffmpeg).args(build_args(&job)).output().unwrap();
             assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
             let bytes = std::fs::metadata(&out).unwrap().len();
@@ -231,4 +231,75 @@ fn discord_presets_fit() {
         }
     }
     assert!(failures.is_empty(), "over the cap on the first pass:\n{}", failures.join("\n"));
+}
+
+/// Issue #6: a ShadowPlay-style file with game sound on track 1 and the
+/// microphone on track 2. Every mix exports one audio track (or none) with
+/// sound from the right tracks, in Precise and Fast mode.
+#[test]
+#[ignore]
+fn multi_track_audio_mixes() {
+    use crate::tracks::TrackMix;
+    let (ffmpeg, ffprobe) = (tool("ffmpeg.exe"), tool("ffprobe.exe"));
+    let dir = std::env::temp_dir().join("cheapedit-it-tracks");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Track 1: game tone. Track 2: "mic", silent for the first 2 s then loud.
+    let src_path = dir.join("two_tracks.mp4");
+    let ok = crate::winutil::hidden_command(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=4"])
+        .args(["-f", "lavfi", "-i", "sine=f=440:d=4:sample_rate=48000", "-f", "lavfi", "-i", r"aevalsrc=if(gte(t\,2)\,0.8*sin(2*PI*660*t)\,0):d=4:s=48000"])
+        .args(["-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-metadata:s:a:1", "title=Mic"])
+        .arg(&src_path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let src = probe::probe(&ffprobe, &src_path).unwrap();
+    assert_eq!(src.audio_tracks.len(), 2);
+    assert_eq!(src.audio_tracks[1].title.as_deref(), Some("Mic"));
+
+    let off = TrackMix { on: false, ..Default::default() };
+    let loud = TrackMix { volume_pct: 150, ..Default::default() };
+    let cases: [(&str, [TrackMix; 2], bool); 4] = [
+        ("both", [TrackMix::default(), loud], true),
+        ("mic only", [off, TrackMix::default()], true),
+        ("game at 150%", [loud, off], true),
+        ("none", [off, off], false),
+    ];
+    let caps = Caps::detect(&ffmpeg);
+    let mut failures = Vec::new();
+    for mode in [CutMode::Precise, CutMode::Fast] {
+        for (i, (label, tracks, want_audio)) in cases.iter().enumerate() {
+            let o = Options { mode, enc_speed: EncSpeed::Faster, ..Default::default() };
+            let out = dir.join(format!("mix{i}_{mode:?}.mp4"));
+            let _ = std::fs::remove_file(&out);
+            let enc = if mode == CutMode::Precise { caps.pick(o.vcodec, false) } else { None };
+            let job = Job { media: &src, opts: &o, start: 0.0, end: 4.0, output: &out, video_encoder: enc, can_tonemap: false, zones: &[], tracks };
+            let args = build_args(&job);
+            let res = crate::winutil::hidden_command(&ffmpeg).args(&args).output().unwrap();
+            if !res.status.success() {
+                failures.push(format!("{label} {mode:?}: {}\n  {}", String::from_utf8_lossy(&res.stderr).trim(), args.join(" ")));
+                continue;
+            }
+            let info = probe::probe(&ffprobe, &out).unwrap();
+            if info.audio_tracks.len() != *want_audio as usize {
+                failures.push(format!("{label} {mode:?}: {} audio tracks", info.audio_tracks.len()));
+                continue;
+            }
+            if *want_audio {
+                // The first 2 s only has game sound; "mic only" must be silent there.
+                let loud_start = crate::waveform::tests_peak(&ffmpeg, &out, 0.2, 1.8);
+                let game_on = tracks[0].on;
+                if game_on != (loud_start > 0.05) {
+                    failures.push(format!("{label} {mode:?}: peak {loud_start:.3} in the first 2 s"));
+                }
+                let loud_end = crate::waveform::tests_peak(&ffmpeg, &out, 2.2, 3.8);
+                if loud_end < 0.05 {
+                    failures.push(format!("{label} {mode:?}: silent in the last 2 s"));
+                }
+            }
+            println!("ok  {label} {mode:?}");
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

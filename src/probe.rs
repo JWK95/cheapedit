@@ -18,6 +18,8 @@ pub struct AudioInfo {
     pub sample_rate: u32,
     #[allow(dead_code)] // shown in the log via Debug
     pub channels: u32,
+    /// The track's name in the file, if it has a meaningful one.
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,7 +31,10 @@ pub struct MediaInfo {
     /// Overall bitrate in bits per second.
     pub bitrate: Option<u64>,
     pub video: Option<VideoInfo>,
+    /// The first audio track (the one players use by default).
     pub audio: Option<AudioInfo>,
+    /// Every audio track, in order (`0:a:N` / mpv `aid` N+1).
+    pub audio_tracks: Vec<AudioInfo>,
 }
 
 impl MediaInfo {
@@ -45,6 +50,9 @@ impl MediaInfo {
         }
         if let Some(a) = &self.audio {
             parts.push(codec_display(&a.codec));
+            if self.audio_tracks.len() > 1 {
+                parts.push(format!("{} audio tracks", self.audio_tracks.len()));
+            }
         } else {
             parts.push("no audio".into());
         }
@@ -104,7 +112,7 @@ fn ratio(s: &str) -> Option<f64> {
 pub fn parse(json: &Value, file: &Path, size_bytes: u64) -> Result<MediaInfo, String> {
     let streams = json["streams"].as_array().cloned().unwrap_or_default();
     let mut video = None;
-    let mut audio = None;
+    let mut audio_tracks: Vec<AudioInfo> = Vec::new();
     let mut stream_dur: f64 = 0.0;
     for s in &streams {
         if let Some(d) = num(&s["duration"]) {
@@ -127,16 +135,18 @@ pub fn parse(json: &Value, file: &Path, size_bytes: u64) -> Result<MediaInfo, St
                     hdr: matches!(transfer, "smpte2084" | "arib-std-b67"),
                 });
             }
-            Some("audio") if audio.is_none() => {
-                audio = Some(AudioInfo {
+            Some("audio") => {
+                audio_tracks.push(AudioInfo {
                     codec: s["codec_name"].as_str().unwrap_or("unknown").to_string(),
                     sample_rate: num(&s["sample_rate"]).unwrap_or(48000.0) as u32,
                     channels: s["channels"].as_u64().unwrap_or(2) as u32,
+                    title: track_title(&s["tags"]),
                 });
             }
             _ => {}
         }
     }
+    let audio = audio_tracks.first().cloned();
     if video.is_none() && audio.is_none() {
         return Err("This file has no video or audio in it.".into());
     }
@@ -151,7 +161,16 @@ pub fn parse(json: &Value, file: &Path, size_bytes: u64) -> Result<MediaInfo, St
         bitrate: num(&json["format"]["bit_rate"]).map(|b| b as u64),
         video,
         audio,
+        audio_tracks,
     })
+}
+
+/// A track's own name. Muxers often fill `handler_name` with boilerplate
+/// like "SoundHandler", which says nothing, so that's skipped.
+fn track_title(tags: &Value) -> Option<String> {
+    let pick = |k: &str| tags[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    // MKV uses "title"; MP4 keeps the name in "name".
+    pick("title").or_else(|| pick("name")).or_else(|| pick("handler_name").filter(|h| !h.to_lowercase().contains("handler")))
 }
 
 #[cfg(test)]
@@ -185,5 +204,25 @@ mod tests {
         )
         .unwrap();
         assert!(parse(&j, Path::new("x.mp3"), 1).unwrap().video.is_none());
+    }
+
+    /// Issue #6: ShadowPlay's separate microphone track.
+    #[test]
+    fn keeps_every_audio_track() {
+        let j: Value = serde_json::from_str(
+            r#"{"streams":[
+                {"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"60/1"},
+                {"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,"tags":{"handler_name":"SoundHandler"}},
+                {"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":1,"tags":{"title":"Microphone"}},
+                {"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":1,"tags":{"handler_name":"SoundHandler","name":"Discord"}}
+              ],"format":{"duration":"30"}}"#,
+        )
+        .unwrap();
+        let m = parse(&j, Path::new("x.mp4"), 1).unwrap();
+        assert_eq!(m.audio_tracks.len(), 3);
+        assert_eq!(m.audio_tracks[2].title.as_deref(), Some("Discord"));
+        assert_eq!(m.audio_tracks[0].title, None);
+        assert_eq!(m.audio_tracks[1].title.as_deref(), Some("Microphone"));
+        assert_eq!(m.audio.unwrap().channels, 2);
     }
 }

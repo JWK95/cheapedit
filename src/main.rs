@@ -19,9 +19,11 @@ mod settings;
 mod setup_ui;
 mod theme;
 mod timecode;
+mod tracks;
 mod update;
 mod validate;
 mod video_view;
+mod waveform;
 mod winutil;
 mod zoom;
 

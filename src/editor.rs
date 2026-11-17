@@ -20,6 +20,8 @@ use eframe::egui::{self, Color32, RichText, Sense, Stroke};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use crate::tracks::{self, TrackMix};
+use crate::waveform;
 
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "mov", "webm", "avi", "m4v", "wmv", "flv", "ts", "mts", "m2ts", "mpg", "mpeg", "3gp", "ogv", "mp3", "wav", "m4a", "flac", "aac", "ogg", "opus",
@@ -45,6 +47,8 @@ struct PreviewState {
     mute: bool,
     no_audio: bool,
     no_video: bool,
+    /// How a file's several audio tracks are mixed.
+    mix: tracks::PreviewAudio,
 }
 
 /// Everything that affects an export; if it changes, an exported preview is stale.
@@ -56,6 +60,7 @@ struct ExportSig {
     until_end: bool,
     opts: Options,
     zones: Vec<Zone>,
+    audio: tracks::ExportAudio,
 }
 
 /// What a drag on the video is doing to the selected zone's box.
@@ -172,6 +177,17 @@ pub struct Editor {
     fresh: Option<(PathBuf, Instant)>,
     /// (clips folder, output folder) the drawer lists were last scanned for.
     lists_for: Option<(Option<PathBuf>, Option<PathBuf>)>,
+    /// One entry per audio track of the open file.
+    tracks: Vec<TrackMix>,
+    /// The track mix the player was last given. Only updated while no mouse
+    /// button is down, so dragging a volume slider doesn't restart mpv's
+    /// audio on every frame.
+    preview_mix: tracks::PreviewAudio,
+    waves: waveform::Waveforms,
+    /// Height the track lanes took last frame.
+    lanes_h: f32,
+    /// To wake the UI from background work.
+    egui_ctx: egui::Context,
     /// A Discord export that's still over its cap after the retry.
     over_cap: Option<String>,
 }
@@ -247,6 +263,11 @@ impl Editor {
             history: crate::history::History::load(),
             fresh: None,
             lists_for: None,
+            tracks: Vec::new(),
+            preview_mix: tracks::PreviewAudio::Normal,
+            waves: waveform::Waveforms::default(),
+            lanes_h: 0.0,
+            egui_ctx: ctx.clone(),
             over_cap: None,
         }
     }
@@ -376,6 +397,7 @@ impl Editor {
             until_end: self.until_end,
             opts: self.effective_opts(),
             zones: self.zones.clone(),
+            audio: tracks::export_audio(&self.tracks),
         })
     }
 
@@ -405,7 +427,7 @@ impl Editor {
         let space = match (&self.media, self.trim(), self.dir_status.2) {
             (Some(m), Some((s, e)), Some(free)) => {
                 let out = PathBuf::new();
-                let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[] };
+                let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[], tracks: &self.tracks };
                 Some((job::estimate_bytes(&j), free))
             }
             _ => None,
@@ -483,6 +505,9 @@ impl Editor {
                 if m.video.as_ref().is_some_and(|v| v.hdr) {
                     self.log.info("HDR video: exports will be converted to standard colour (SDR).");
                 }
+                self.tracks = vec![TrackMix::default(); m.audio_tracks.len()];
+                self.preview_mix = tracks::preview_audio(&self.tracks);
+                self.waves.load(&self.ffmpeg, &m.path, m.audio_tracks.len(), &self.egui_ctx);
                 self.media = Some(m);
             }
             Err(e) => {
@@ -546,7 +571,7 @@ impl Editor {
         let encodes_video = o.mode == CutMode::Precise && o.av != AvMode::AudioOnly && m.video.is_some();
         let enc = if encodes_video { caps.pick(o.vcodec, o.use_gpu) } else { None };
         let zones = self.active_zones();
-        let j = Job { media: &m, opts: &o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &zones };
+        let j = Job { media: &m, opts: &o, start, end, output: &out, video_encoder: enc, can_tonemap: caps.zscale, zones: &zones, tracks: &self.tracks };
         if !zones.is_empty() {
             self.log.info(format!("Zooming {} zone(s)", zones.len()));
         }
@@ -785,6 +810,7 @@ impl Editor {
             mute: false,
             no_audio: false,
             no_video: false,
+            mix: if exported { tracks::PreviewAudio::Normal } else { self.preview_mix.clone() },
         };
         match self.view {
             View::Original => neutral(src, false),
@@ -801,6 +827,7 @@ impl Editor {
                     mute: o.av == AvMode::Mute,
                     no_audio: o.av == AvMode::RemoveAudio,
                     no_video: o.av == AvMode::AudioOnly,
+                    mix: self.preview_mix.clone(),
                 },
             },
         }
@@ -843,6 +870,18 @@ impl Editor {
         let Some(v) = &self.video else { return };
         let p = &v.player;
         let prev = self.applied.clone();
+        // Several audio tracks: mpv mixes them with a filter graph. Set it
+        // before loading a file, so a graph naming track 2 never meets a file
+        // that only has one.
+        let graph = match (&want.mix, want.no_audio) {
+            (tracks::PreviewAudio::Graph(g), false) => g.as_str(),
+            _ => "",
+        };
+        p.set_property("lavfi-complex", graph);
+        if graph.is_empty() {
+            let silent = want.no_audio || want.mix == tracks::PreviewAudio::Silent;
+            p.set_property("aid", if silent { "no" } else { "auto" });
+        }
         if want.file != self.loaded {
             if let Some(f) = &want.file {
                 p.load_file(f);
@@ -856,7 +895,6 @@ impl Editor {
         let heard = want.volume as u64 * self.settings.preview_volume as u64 / 100;
         p.set_property("volume", &heard.to_string());
         p.set_property("mute", if want.mute { "yes" } else { "no" });
-        p.set_property("aid", if want.no_audio { "no" } else { "auto" });
         p.set_property("vid", if want.no_video { "no" } else { "auto" });
         match want.range {
             Some((a, b)) => {
@@ -897,6 +935,10 @@ impl Editor {
             if ev.restarted {
                 self.awaiting_frame = None;
             }
+        }
+        let mix = tracks::preview_audio(&self.tracks);
+        if mix != self.preview_mix && !ctx.input(|i| i.pointer.any_down()) {
+            self.preview_mix = mix;
         }
         self.settle_scrub(&ctx);
         self.track_ghost();
@@ -1058,7 +1100,7 @@ impl Editor {
         ui.add_space(4.0);
 
         // Leave room below the video for the timeline, controls and shortcut strip.
-        let below = if self.show_bands() { 182.0 } else { 160.0 };
+        let below = if self.show_bands() { 182.0 } else { 160.0 } + self.lanes_h;
         let avail = ui.available_size();
         let video_h = (avail.y - below).max(120.0);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail.x, video_h), Sense::click_and_drag());
@@ -1377,6 +1419,20 @@ impl Editor {
         if let Some((s, e)) = range {
             let r = egui::Rect::from_x_y_ranges(x_of(s)..=x_of(e), rect.y_range());
             painter.rect_filled(r, 0.0, theme::ACCENT_DIM.gamma_multiply(0.8));
+        }
+        if self.settings.show_waveform && !exported_view {
+            // What the export will sound like: the tracks that are on, at their volumes.
+            let heard: Vec<(Arc<waveform::Peaks>, f32)> = if self.tracks.len() < 2 {
+                self.waves.track(0).map(|p| (p, 1.0)).into_iter().collect()
+            } else {
+                self.tracks.iter().enumerate().filter(|(_, t)| t.on).filter_map(|(i, t)| Some((self.waves.track(i)?, t.gain() as f32))).collect()
+            };
+            if !heard.is_empty() {
+                let level = |t0: f64, t1: f64| heard.iter().map(|(p, g)| waveform::peak_between(p, t0, t1).unwrap_or(0.0) * g).sum::<f32>().min(1.0);
+                draw_wave(&painter, rect.shrink2(egui::vec2(0.0, 4.0)), duration, Color32::from_white_alpha(46), level);
+            }
+        }
+        if let Some((s, e)) = range {
             for x in [x_of(s), x_of(e)] {
                 painter.rect_filled(egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(6.0, rect.height() + 4.0)), 2.0, theme::CORAL);
             }
@@ -1459,6 +1515,16 @@ impl Editor {
             let t_of = move |x: f32| (((x - left) / width).clamp(0.0, 1.0) as f64) * duration;
             self.zone_bands_ui(ui, &x_of, &t_of);
         }
+        // Measured, so the video above shrinks to make room for the lanes.
+        let lanes_top = ui.cursor().top();
+        if self.tracks.len() > 1 && !exported_view && self.media.is_some() {
+            self.track_lanes_ui(ui, rect.x_range(), duration, range);
+        }
+        let lanes_h = ui.cursor().top() - lanes_top;
+        if (lanes_h - self.lanes_h).abs() > 0.5 {
+            self.lanes_h = lanes_h;
+            ui.ctx().request_repaint();
+        }
         let click_hint = |a: Action| self.settings.keybinds.get(a).map(|b| b.display());
         let hint = match (click_hint(Action::TimelineStart), click_hint(Action::TimelineEnd)) {
             (Some(s), Some(e)) => format!("{s}: set start  ·  {e}: set end"),
@@ -1474,10 +1540,95 @@ impl Editor {
                 let y = left.center().y;
                 ui.painter().text(egui::pos2(rect.center().x, y), egui::Align2::CENTER_CENTER, &hint, egui::FontId::proportional(12.0), theme::MUTED);
             }
+            let mut show_wave = self.settings.show_waveform;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(mono(duration));
+                if self.media.as_ref().is_some_and(|m| m.audio.is_some()) && !exported_view {
+                    ui.add_space(8.0);
+                    if ui
+                        .selectable_label(show_wave, RichText::new("Waveform").small())
+                        .on_hover_text("Show the audio's waveform on the timeline, so you can spot the loud moments")
+                        .clicked()
+                    {
+                        show_wave = !show_wave;
+                    }
+                }
             });
+            self.settings.show_waveform = show_wave;
         });
+    }
+
+    /// One lane per audio track under the timeline: its name, on/off, Solo
+    /// and volume, over its own waveform. Clicking a lane's waveform seeks.
+    fn track_lanes_ui(&mut self, ui: &mut egui::Ui, xs: egui::Rangef, duration: f64, range: Option<(f64, f64)>) {
+        let pos = self.position();
+        let names: Vec<Option<String>> = self.media.as_ref().map(|m| m.audio_tracks.iter().map(|t| t.title.clone()).collect()).unwrap_or_default();
+        let soloing = self.tracks.iter().any(|t| t.solo);
+        let x_of = |t: f64| xs.min + (t / duration).clamp(0.0, 1.0) as f32 * xs.span();
+        let t_of = |x: f32| (((x - xs.min) / xs.span()).clamp(0.0, 1.0) as f64) * duration;
+        for i in 0..self.tracks.len() {
+            ui.add_space(2.0);
+            let mut t = self.tracks[i];
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let name = match names.get(i).cloned().flatten() {
+                    Some(n) => format!("Track {} · {n}", i + 1),
+                    None => format!("Track {}", i + 1),
+                };
+                ui.checkbox(&mut t.on, RichText::new(name).small().strong())
+                    .on_hover_text("Include this track in the export (and the preview)");
+                let solo = ui
+                    .selectable_label(t.solo, RichText::new("Solo").small())
+                    .on_hover_text("Hear only this track while you edit. Doesn't change the export.");
+                if solo.clicked() {
+                    t.solo = !t.solo;
+                }
+                ui.add_enabled(t.on, egui::Slider::new(&mut t.volume_pct, 0..=200).suffix("%").show_value(true))
+                    .on_hover_text("This track's volume in the mix");
+                if t.volume_pct != 100 && ui.small_button("Reset").on_hover_text("Back to 100%").clicked() {
+                    t.volume_pct = 100;
+                }
+                if soloing && !t.solo {
+                    theme::hint(ui, "muted by Solo");
+                }
+            });
+            self.tracks[i] = t;
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), Sense::click_and_drag());
+            let rect = egui::Rect::from_x_y_ranges(xs, rect.y_range());
+            let painter = ui.painter_at(rect.expand(2.0));
+            painter.rect_filled(rect, 4.0, theme::CARD);
+            if let Some((s, e)) = range {
+                painter.rect_filled(egui::Rect::from_x_y_ranges(x_of(s)..=x_of(e), rect.y_range()), 0.0, theme::ACCENT_DIM.gamma_multiply(0.45));
+            }
+            let audible = if soloing { t.solo } else { t.on };
+            let col = if audible { theme::ACCENT.gamma_multiply(0.9) } else { Color32::from_white_alpha(28) };
+            match self.waves.track(i) {
+                Some(p) => draw_wave(&painter, rect.shrink2(egui::vec2(0.0, 2.0)), duration, col, |a, b| waveform::peak_between(&p, a, b).unwrap_or(0.0) * t.gain() as f32),
+                None => {
+                    painter.text(rect.left_center() + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, "Reading audio…", egui::FontId::proportional(11.0), theme::MUTED);
+                }
+            }
+            let px = x_of(pos);
+            painter.line_segment([egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())], Stroke::new(1.5, Color32::WHITE));
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if let Some(p) = resp.interact_pointer_pos() {
+                let t = t_of(p.x);
+                if resp.clicked() {
+                    self.scrub = None;
+                    self.seek(t);
+                } else if resp.dragged() {
+                    self.scrub_to(t);
+                }
+            }
+            if resp.drag_stopped() {
+                self.end_scrub();
+            }
+        }
+        if self.tracks.iter().all(|t| !t.on) {
+            ui.label(RichText::new("Every track is off, so the export will have no audio.").small().color(theme::WARN));
+        }
     }
 
     fn transport_ui(&mut self, ui: &mut egui::Ui) {
@@ -1546,6 +1697,7 @@ impl Editor {
                 {
                     self.settings.show_ghost = !self.settings.show_ghost;
                 }
+
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if has {
@@ -2217,7 +2369,7 @@ impl Editor {
         let (Some(m), Some((s, e))) = (self.media.as_ref(), self.trim()) else { return };
         let o = self.effective_opts();
         let out = PathBuf::new();
-        let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[] };
+        let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[], tracks: &self.tracks };
         let est = job::estimate(&j);
         let dur = job::output_duration(s, e, o.effective_speed());
         let plan = if self.discord_active() { self.discord_plan().and_then(Result::ok) } else { None };
@@ -2345,8 +2497,9 @@ impl Editor {
         });
     }
 
-    /// A drawer half's heading, Refresh button and folder line.
-    fn half_header(&mut self, ui: &mut egui::Ui, title: &str, dir: Option<&Path>, scanning: bool, ctx: &egui::Context) -> bool {
+    /// A drawer half's heading, Refresh button, Audio checkbox and folder line.
+    /// Returns true if "Change" was clicked.
+    fn half_header(&mut self, ui: &mut egui::Ui, title: &str, dir: Option<&Path>, scanning: bool, show_audio: &mut bool, ctx: &egui::Context) -> bool {
         let mut change = false;
         ui.horizontal(|ui| {
             theme::section(ui, title);
@@ -2355,6 +2508,8 @@ impl Editor {
                     if ui.small_button("Refresh").on_hover_text("Look for new files").clicked() {
                         self.rescan_lists(ctx);
                     }
+                    ui.checkbox(show_audio, RichText::new("Audio").small())
+                        .on_hover_text("Also list audio files (MP3, WAV, M4A…). Untick to show only videos.");
                     if scanning {
                         ui.spinner();
                     }
@@ -2376,9 +2531,11 @@ impl Editor {
 
     fn editing_half(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let dir = self.settings.clips_dir.clone();
-        if self.half_header(ui, "Editing files", dir.as_deref(), self.library.scanning(), ctx) {
+        let mut show_audio = self.settings.editing_show_audio;
+        if self.half_header(ui, "Editing files", dir.as_deref(), self.library.scanning(), &mut show_audio, ctx) {
             self.choose_clips_folder(ctx);
         }
+        self.settings.editing_show_audio = show_audio;
         if dir.is_none() {
             theme::hint(ui, "Choose the folder your game clips are saved in, for example Videos\\NVIDIA. Clips are grouped by game, newest first.");
             if ui.button("Choose clips folder").clicked() {
@@ -2386,21 +2543,23 @@ impl Editor {
             }
             return;
         }
-        if self.library.groups.is_empty() {
+        if !self.library.all().any(|c| show_audio || !c.audio) {
             theme::hint(ui, if self.library.scanning() { "Looking for clips…" } else { "No videos in this folder yet." });
             return;
         }
         let current = self.media.as_ref().map(|m| m.path.clone());
-        let list = ClipList { id: "editing", current: current.as_deref(), history: Some(&self.history), fresh: None, draggable: false };
+        let list = ClipList { id: "editing", current: current.as_deref(), history: Some(&self.history), fresh: None, draggable: false, show_audio };
         let act = list.show(ui, &self.library);
         self.do_list_actions(act, None, ctx);
     }
 
     fn finished_half(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, ctx: &egui::Context) {
         let dir = self.settings.output_dir.clone();
-        if self.half_header(ui, "Finished files", dir.as_deref(), self.finished.scanning(), ctx) {
+        let mut show_audio = self.settings.finished_show_audio;
+        if self.half_header(ui, "Finished files", dir.as_deref(), self.finished.scanning(), &mut show_audio, ctx) {
             self.choose_folder();
         }
+        self.settings.finished_show_audio = show_audio;
         if let Some((note, at)) = &self.copy_note {
             if at.elapsed() < Duration::from_secs(4) {
                 ui.label(RichText::new(note).small().color(theme::OK));
@@ -2414,7 +2573,7 @@ impl Editor {
             }
             return;
         }
-        if self.finished.groups.is_empty() {
+        if !self.finished.all().any(|c| show_audio || !c.audio) {
             theme::hint(ui, if self.finished.scanning() { "Looking…" } else { "Nothing exported yet." });
             return;
         }
@@ -2423,7 +2582,7 @@ impl Editor {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
         let current = self.media.as_ref().map(|m| m.path.clone());
-        let list = ClipList { id: "finished", current: current.as_deref(), history: None, fresh: fresh.as_ref().map(|(p, at)| (p.as_path(), *at)), draggable: true };
+        let list = ClipList { id: "finished", current: current.as_deref(), history: None, fresh: fresh.as_ref().map(|(p, at)| (p.as_path(), *at)), draggable: true, show_audio };
         let act = list.show(ui, &self.finished);
         self.do_list_actions(act, Some(frame), ctx);
     }
@@ -2542,6 +2701,8 @@ struct ClipList<'a> {
     fresh: Option<(&'a Path, Instant)>,
     /// Rows can be dragged out to other apps (Finished list only).
     draggable: bool,
+    /// List audio files as well as videos.
+    show_audio: bool,
 }
 
 impl ClipList<'_> {
@@ -2550,15 +2711,19 @@ impl ClipList<'_> {
         let now = std::time::SystemTime::now();
         egui::ScrollArea::vertical().id_salt(self.id).auto_shrink(false).show(ui, |ui| {
             for g in &lib.groups {
-                let holds_fresh = self.fresh.is_some_and(|(p, _)| g.clips.iter().any(|c| c.path == p));
-                let mut header = egui::CollapsingHeader::new(RichText::new(format!("{}  ({})", g.game, g.clips.len())).strong())
+                let shown: Vec<&clips::Clip> = g.clips.iter().filter(|c| self.show_audio || !c.audio).collect();
+                if shown.is_empty() {
+                    continue;
+                }
+                let holds_fresh = self.fresh.is_some_and(|(p, _)| shown.iter().any(|c| c.path == p));
+                let mut header = egui::CollapsingHeader::new(RichText::new(format!("{}  ({})", g.game, shown.len())).strong())
                     .id_salt((self.id, &g.game))
                     .default_open(true);
                 if holds_fresh {
                     header = header.open(Some(true));
                 }
                 header.show(ui, |ui| {
-                    for c in &g.clips {
+                    for c in shown {
                         let tick = self.history.and_then(|h| h.get(&c.path)).map(crate::history::describe);
                         let fresh = self.fresh.filter(|(p, _)| *p == c.path).map(|(_, at)| at);
                         let resp = self.row(ui, c, now, tick);
@@ -2623,6 +2788,22 @@ impl ClipList<'_> {
             ui.interact(tr, ui.scope_id().with((self.id, "tick", &c.path)), Sense::hover()).on_hover_text(t);
         }
         resp.on_hover_text(format!("{}\n{how}", c.path.display()))
+    }
+}
+
+/// A waveform: one bar per pixel column, mirrored around the middle.
+/// `level(t0, t1)` gives the loudest moment (0-1) between two times.
+fn draw_wave(painter: &egui::Painter, rect: egui::Rect, duration: f64, color: Color32, level: impl Fn(f64, f64) -> f32) {
+    let cols = rect.width().max(1.0) as usize;
+    let step = duration / cols as f64;
+    let mid = rect.center().y;
+    let half = rect.height() / 2.0;
+    for c in 0..cols {
+        let h = waveform::height(level(c as f64 * step, (c + 1) as f64 * step)) * half;
+        if h >= 0.5 {
+            let x = rect.left() + c as f32 + 0.5;
+            painter.line_segment([egui::pos2(x, mid - h), egui::pos2(x, mid + h)], Stroke::new(1.0, color));
+        }
     }
 }
 

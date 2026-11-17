@@ -96,7 +96,7 @@ mod tests {
     use std::time::SystemTime;
 
     fn clip(p: &str) -> Clip {
-        Clip { path: PathBuf::from(p), name: String::new(), modified: SystemTime::UNIX_EPOCH, size: 0 }
+        Clip { path: PathBuf::from(p), name: String::new(), modified: SystemTime::UNIX_EPOCH, size: 0, audio: false }
     }
 
     #[test]

@@ -42,7 +42,9 @@ Video preview on the left, tools on the right (see the approved mockup), and an 
 **Left side:**
 - Original / Result toggle, plus a source info line (resolution, frame rate, codec)
 - the player
-- a timeline with draggable start and end handles, kept in sync with the trim boxes
+- a timeline with draggable start and end handles, kept in sync with the trim boxes. Dragging on it scrubs: the playhead follows the cursor at once, the picture jumps to keyframes while moving, and an exact seek lands on release (v0.4.1).
+- a **waveform** drawn faintly inside the timeline (added in v0.5.0, issue #7): the mix of the audio tracks that are on, at their volumes, so you can see the loud moments. A **Waveform** toggle under the timeline, next to the end time, shows or hides it (remembered, on by default). It's worked out in the background by FFmpeg (8 kHz mono, one peak per 1/100 s per track), drawn on a decibel scale, and hidden while the exported file is playing.
+- **audio track lanes** under the timeline (section 8a), only for files with two or more audio tracks
 - transport buttons (frame back, play, frame forward), plus Set start and Set end
 - a **ghost line**: a thin, faint line on the timeline where playback last started (set whenever the player goes from paused to playing, on the source only; cleared when another video is opened). **Go to ghost** moves the playhead there, **Start at ghost** sets the trim start there, **Play at ghost** jumps back to it and plays (the line stays put), and a **Ghost** toggle shows or hides the line (remembered).
 - a **Listen** volume slider (0–100 %, remembered), at the right of the shortcut strip, for the player only. It never changes the export; the clip's own volume is in Audio and video.
@@ -70,7 +72,8 @@ A drawer on the far left with two file lists, one above the other.
 
 - **Collapsible:** a **Clips** button with a three-line menu icon (drawn, since the ☰ glyph isn't in the built-in fonts) at the left of the top bar shows or hides it. It's about 250 px wide and resizable (190–480 px).
 - **Split:** **Editing files** on top, **Finished files** below, with a divider that can be dragged (each half 15–85 %, starting at 50/50). Each half scrolls on its own. Open/closed, width, split and folders are remembered.
-- **Editing files:** the clips folder the user chooses, with its subfolders (up to 6 levels, 20,000 files), video files only. The **output folder is left out**, so exports only appear under Finished.
+- **Editing files:** the clips folder the user chooses, with its subfolders (up to 6 levels, 20,000 files). The **output folder is left out**, so exports only appear under Finished.
+- **Audio files** (`mp3`, `m4a`, `wav`, `flac`, `ogg`, `opus`) are listed in both halves alongside videos (v0.5.0, issue #5: MP3 exports were missing from Finished). Each half has its own **Audio** checkbox in its header to hide them; both are on by default and remembered.
   - No folder yet: a short explanation and a **Choose clips folder** button. **Change** switches folder later.
   - **Click** opens the clip (blocked during an export, like Open). No dragging. **Right-click:** Show in folder, Copy file.
   - A green tick (drawn with lines, since the built-in fonts have no check-mark glyph) marks a clip that has been exported. Hovering it shows "Exported 3 times, last 17-11-26 21-04" (see Export history below).
@@ -165,6 +168,18 @@ Zoom into part of the picture for a stretch of time. Done entirely with FFmpeg (
 4. **Audio only (MP3)**: no video. Bitrate choices are 128, 192 (default) and 320 kbps.
 
 A volume slider (0–200%) appears in every mode that has audio.
+
+## 8a. Several audio tracks (added in v0.5.0, issue #6)
+
+Recorders like ShadowPlay can put game sound and the microphone on separate tracks. Files with **two or more** audio tracks get one **lane** per track under the timeline; files with one track look exactly as before.
+
+- **Lane:** "Track N", plus the track's name from the file when it has a real one (MKV `title`, MP4 `name`; boilerplate like "SoundHandler" is ignored). Under it, the track's own waveform with the trim range and playhead; clicking or dragging it seeks like the timeline.
+- **On/off** (checkbox): the track is in the export and the preview. If every track is off, the export has no audio and a warning says so.
+- **Volume** (0–200 %, with Reset): the track's level in the mix.
+- **Solo:** hear only the soloed track(s) while editing. Preview only; it never changes the export.
+- Track settings belong to the open file and reset when another file is opened. They're not saved.
+- **Export:** the tracks that are on are mixed into **one** audio track (`amix` with `normalize=0`, so each keeps its loudness), because Discord, browsers and phones only play the first track of a file. The Audio and video volume, Mute and Remove audio apply on top as a master control. A single track that's on at 100 % is taken as it is (so Fast mode can still copy it); any real mix is re-encoded, also in Fast mode.
+- **Preview:** mpv mixes the same tracks with a `lavfi-complex` graph. It's only updated when no mouse button is held, so dragging a volume slider doesn't restart the audio on every frame.
 
 ## 9. Formats and codecs
 
@@ -290,7 +305,7 @@ The timeline-click bindings are rebound by choosing a modifier: Ctrl, Shift, Alt
 ## 15. Settings
 
 - Stored in `%APPDATA%\cheapedit\settings.toml`.
-- Holds the output folder, last-used options (including the preset), keybindings, and the Clips drawer's folder, open/closed state, width and split. Export history is kept separately in `exports.json`.
+- Holds the output folder, last-used options (including the preset), keybindings, the Clips drawer's folder, open/closed state, width, split and Audio checkboxes, and the Ghost and Waveform toggles. Export history is kept separately in `exports.json`.
 
 ## 16. Installer and branding
 
