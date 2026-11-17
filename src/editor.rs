@@ -143,6 +143,11 @@ pub struct Editor {
     box_drag: Option<BoxDrag>,
     /// Dragging a zone band's edge on the timeline: (zone, is start).
     band_drag: Option<(usize, bool)>,
+    /// Where a timeline drag is pointing. While set, the playhead shows this
+    /// instead of mpv's position, so it sticks to the cursor even when mpv's
+    /// seeks lag behind. After release it holds (with the release time) until
+    /// mpv's exact seek lands, so the playhead doesn't jump back.
+    scrub: Option<(f64, Option<Instant>)>,
     /// The zoom last given to mpv for the live preview.
     live_zoom: ZBox,
     /// A file was just loaded: keep checking mpv until its first frame is
@@ -229,6 +234,7 @@ impl Editor {
             drawing: false,
             box_drag: None,
             band_drag: None,
+            scrub: None,
             live_zoom: ZBox::FULL,
             awaiting_frame: None,
             ghost: None,
@@ -352,11 +358,14 @@ impl Editor {
     }
 
     fn position(&self) -> f64 {
-        self.video.as_ref().and_then(|v| v.player.get_f64("time-pos")).unwrap_or(0.0)
+        if let Some((t, _)) = self.scrub {
+            return t;
+        }
+        self.video.as_ref().and_then(|v| v.player.time_pos()).unwrap_or(0.0)
     }
 
     fn paused(&self) -> bool {
-        self.video.as_ref().and_then(|v| v.player.get_flag("pause")).unwrap_or(true)
+        self.video.as_ref().and_then(|v| v.player.paused()).unwrap_or(true)
     }
 
     fn export_sig(&self) -> Option<ExportSig> {
@@ -632,6 +641,41 @@ impl Editor {
         }
     }
 
+    /// Follow a drag on the timeline. Exact seeks decode from the previous
+    /// keyframe, so sending one per frame piles up and the picture falls
+    /// seconds behind the mouse. While dragging, jump to keyframes (cheap)
+    /// and only send a seek when the target actually moved.
+    fn scrub_to(&mut self, t: f64) {
+        if self.scrub.is_some_and(|(s, settling)| settling.is_none() && (s - t).abs() < 1e-3) {
+            return;
+        }
+        self.scrub = Some((t, None));
+        if let Some(v) = &self.video {
+            v.player.command(&["seek", &t.to_string(), "absolute+keyframes"]);
+        }
+    }
+
+    /// The drag ended: land exactly on the frame under the cursor.
+    fn end_scrub(&mut self) {
+        if let Some((t, None)) = self.scrub {
+            self.seek(t);
+            self.scrub = Some((t, Some(Instant::now())));
+        }
+    }
+
+    /// Drop the held scrub position once mpv has caught up with it.
+    fn settle_scrub(&mut self, ctx: &egui::Context) {
+        let Some((t, Some(since))) = self.scrub else { return };
+        let v = self.video.as_ref();
+        let seeking = v.and_then(|v| v.player.seeking()).unwrap_or(false);
+        let there = v.and_then(|v| v.player.time_pos()).is_some_and(|p| (p - t).abs() < 0.25);
+        if (!seeking && there) || since.elapsed() > Duration::from_millis(1500) {
+            self.scrub = None;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
     fn pause(&self) {
         if let Some(v) = &self.video {
             v.player.set_property("pause", "yes");
@@ -854,6 +898,7 @@ impl Editor {
                 self.awaiting_frame = None;
             }
         }
+        self.settle_scrub(&ctx);
         self.track_ghost();
         if let Some(t) = self.awaiting_frame {
             if t.elapsed() < Duration::from_secs(5) {
@@ -1299,11 +1344,12 @@ impl Editor {
                 } else {
                     z.end_text = timecode::format_compact(t);
                 }
-                self.seek(t);
+                self.scrub_to(t);
             }
         }
         if resp.drag_stopped() {
             self.band_drag = None;
+            self.end_scrub();
         }
         if resp.clicked() {
             if let Some(i) = resp.interact_pointer_pos().and_then(zone_at) {
@@ -1315,7 +1361,7 @@ impl Editor {
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
         let exported_view = self.view == View::Result && self.exported_file.is_some();
         let duration = if exported_view {
-            self.video.as_ref().and_then(|v| v.player.get_f64("duration")).unwrap_or(1.0)
+            self.video.as_ref().and_then(|v| v.player.duration()).unwrap_or(1.0)
         } else {
             self.media.as_ref().map(|m| m.duration).unwrap_or(1.0)
         }
@@ -1381,13 +1427,17 @@ impl Editor {
                         }
                         Drag::Scrub => {}
                     }
-                    if let Some(v) = &self.video {
-                        v.player.command(&["seek", &t.to_string(), "absolute+exact"]);
+                    if resp.clicked() {
+                        self.scrub = None;
+                        self.seek(t);
+                    } else {
+                        self.scrub_to(t);
                     }
                 }
             }
             if resp.drag_stopped() || resp.clicked() {
                 self.drag = None;
+                self.end_scrub();
             }
             if let Some(p) = resp.hover_pos() {
                 let near_handle = range.is_some_and(|(s, e)| (p.x - x_of(s)).abs() < 8.0 || (p.x - x_of(e)).abs() < 8.0);

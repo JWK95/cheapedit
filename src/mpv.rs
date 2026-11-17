@@ -4,6 +4,7 @@
 //! what is missing, and pick the DLL up as soon as the user installs it.
 //! Every raw handle is owned by a wrapper whose `Drop` frees it.
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::Arc;
@@ -45,6 +46,14 @@ struct MpvEvent {
     data: *mut c_void,
 }
 
+#[repr(C)]
+struct MpvEventProperty {
+    name: *const c_char,
+    format: c_int,
+    data: *mut c_void,
+}
+
+const FORMAT_STRING: c_int = 1;
 const FORMAT_FLAG: c_int = 3;
 const FORMAT_DOUBLE: c_int = 5;
 const RENDER_PARAM_API_TYPE: c_int = 1;
@@ -58,6 +67,13 @@ const EVENT_END_FILE: c_int = 7;
 const EVENT_FILE_LOADED: c_int = 8;
 const EVENT_VIDEO_RECONFIG: c_int = 17;
 const EVENT_PLAYBACK_RESTART: c_int = 21;
+const EVENT_PROPERTY_CHANGE: c_int = 22;
+
+// Properties the app reads, watched through events (see `Player`).
+const OBS_TIME_POS: u64 = 1;
+const OBS_PAUSE: u64 = 2;
+const OBS_SEEKING: u64 = 3;
+const OBS_DURATION: u64 = 4;
 
 type UpdateCb = unsafe extern "C" fn(*mut c_void);
 
@@ -70,9 +86,9 @@ pub struct Api {
     initialize: unsafe extern "C" fn(*mut MpvHandle) -> c_int,
     terminate_destroy: unsafe extern "C" fn(*mut MpvHandle),
     set_option_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
-    set_property_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
-    get_property: unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int,
-    command: unsafe extern "C" fn(*mut MpvHandle, *mut *const c_char) -> c_int,
+    set_property_async: unsafe extern "C" fn(*mut MpvHandle, u64, *const c_char, c_int, *mut c_void) -> c_int,
+    observe_property: unsafe extern "C" fn(*mut MpvHandle, u64, *const c_char, c_int) -> c_int,
+    command_async: unsafe extern "C" fn(*mut MpvHandle, u64, *mut *const c_char) -> c_int,
     wait_event: unsafe extern "C" fn(*mut MpvHandle, f64) -> *mut MpvEvent,
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
     render_create: unsafe extern "C" fn(*mut *mut MpvRenderContext, *mut MpvHandle, *mut RenderParam) -> c_int,
@@ -106,9 +122,9 @@ impl Api {
             initialize: sym!(lib, "mpv_initialize"),
             terminate_destroy: sym!(lib, "mpv_terminate_destroy"),
             set_option_string: sym!(lib, "mpv_set_option_string"),
-            set_property_string: sym!(lib, "mpv_set_property_string"),
-            get_property: sym!(lib, "mpv_get_property"),
-            command: sym!(lib, "mpv_command"),
+            set_property_async: sym!(lib, "mpv_set_property_async"),
+            observe_property: sym!(lib, "mpv_observe_property"),
+            command_async: sym!(lib, "mpv_command_async"),
             wait_event: sym!(lib, "mpv_wait_event"),
             error_string: sym!(lib, "mpv_error_string"),
             render_create: sym!(lib, "mpv_render_context_create"),
@@ -142,9 +158,20 @@ pub struct PlayerEvents {
 }
 
 /// One mpv instance. Dropping it destroys the instance.
+///
+/// Nothing here waits on mpv's core. The UI thread is also mpv's render
+/// thread, and the core sometimes waits for a frame to be rendered: a
+/// synchronous call made then stalls both until mpv gives up (~200 ms),
+/// which made scrubbing crawl. So commands and property writes are queued
+/// (`_async`), and the properties the app reads are watched and cached as
+/// change events arrive in `poll_events`.
 pub struct Player {
     api: Arc<Api>,
     handle: *mut MpvHandle,
+    time_pos: Cell<Option<f64>>,
+    pause: Cell<Option<bool>>,
+    seeking: Cell<Option<bool>>,
+    duration: Cell<Option<f64>>,
 }
 
 impl Player {
@@ -153,7 +180,7 @@ impl Player {
         if handle.is_null() {
             return Err("libmpv couldn't create a player.".into());
         }
-        let p = Player { api, handle };
+        let p = Player { api, handle, time_pos: Cell::new(None), pause: Cell::new(None), seeking: Cell::new(None), duration: Cell::new(None) };
         for (k, v) in [
             ("vo", "libmpv"),
             ("hwdec", "auto-copy"),
@@ -175,6 +202,17 @@ impl Player {
         if rc < 0 {
             return Err(format!("libmpv failed to start: {}", p.api.err(rc)));
         }
+        for (id, name, format) in [
+            (OBS_TIME_POS, c"time-pos", FORMAT_DOUBLE),
+            (OBS_PAUSE, c"pause", FORMAT_FLAG),
+            (OBS_SEEKING, c"seeking", FORMAT_FLAG),
+            (OBS_DURATION, c"duration", FORMAT_DOUBLE),
+        ] {
+            let rc = unsafe { (p.api.observe_property)(p.handle, id, name.as_ptr(), format) };
+            if rc < 0 {
+                return Err(format!("libmpv couldn't watch {name:?}: {}", p.api.err(rc)));
+            }
+        }
         Ok(p)
     }
 
@@ -184,30 +222,39 @@ impl Player {
         if rc < 0 { Err(format!("mpv option {:?}: {}", k, self.api.err(rc))) } else { Ok(()) }
     }
 
+    /// Queue a property change (mpv copies the value).
     pub fn set_property(&self, k: &str, v: &str) {
         let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
-        unsafe { (self.api.set_property_string)(self.handle, k.as_ptr(), v.as_ptr()) };
+        let mut ptr = v.as_ptr();
+        unsafe { (self.api.set_property_async)(self.handle, 0, k.as_ptr(), FORMAT_STRING, &mut ptr as *mut *const c_char as *mut c_void) };
     }
 
-    pub fn get_f64(&self, k: &str) -> Option<f64> {
-        let k = CString::new(k).unwrap();
-        let mut out: f64 = 0.0;
-        let rc = unsafe { (self.api.get_property)(self.handle, k.as_ptr(), FORMAT_DOUBLE, &mut out as *mut f64 as *mut c_void) };
-        (rc >= 0).then_some(out)
-    }
-
-    pub fn get_flag(&self, k: &str) -> Option<bool> {
-        let k = CString::new(k).unwrap();
-        let mut out: c_int = 0;
-        let rc = unsafe { (self.api.get_property)(self.handle, k.as_ptr(), FORMAT_FLAG, &mut out as *mut c_int as *mut c_void) };
-        (rc >= 0).then_some(out != 0)
-    }
-
+    /// Queue a command. Commands run in the order they're sent.
     pub fn command(&self, args: &[&str]) {
         let owned: Vec<CString> = args.iter().map(|a| CString::new(*a).unwrap()).collect();
         let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(std::ptr::null());
-        unsafe { (self.api.command)(self.handle, ptrs.as_mut_ptr()) };
+        unsafe { (self.api.command_async)(self.handle, 0, ptrs.as_mut_ptr()) };
+    }
+
+    /// Playback position in seconds, as of the last `poll_events`.
+    pub fn time_pos(&self) -> Option<f64> {
+        self.time_pos.get()
+    }
+
+    /// As of the last `poll_events`.
+    pub fn paused(&self) -> Option<bool> {
+        self.pause.get()
+    }
+
+    /// A seek is still in progress, as of the last `poll_events`.
+    pub fn seeking(&self) -> Option<bool> {
+        self.seeking.get()
+    }
+
+    /// Length of the loaded file in seconds, as of the last `poll_events`.
+    pub fn duration(&self) -> Option<f64> {
+        self.duration.get()
     }
 
     pub fn load_file(&self, path: &Path) {
@@ -224,6 +271,19 @@ impl Player {
                 EVENT_FILE_LOADED => ev.file_loaded = true,
                 EVENT_END_FILE => ev.end_file = true,
                 EVENT_VIDEO_RECONFIG | EVENT_PLAYBACK_RESTART => ev.restarted = true,
+                EVENT_PROPERTY_CHANGE if !e.data.is_null() => {
+                    let prop = unsafe { &*(e.data as *const MpvEventProperty) };
+                    // Format 0 (none) means the property is unavailable right now.
+                    let num = (prop.format == FORMAT_DOUBLE && !prop.data.is_null()).then(|| unsafe { *(prop.data as *const f64) });
+                    let flag = (prop.format == FORMAT_FLAG && !prop.data.is_null()).then(|| unsafe { *(prop.data as *const c_int) } != 0);
+                    match e.reply_userdata {
+                        OBS_TIME_POS => self.time_pos.set(num),
+                        OBS_PAUSE => self.pause.set(flag),
+                        OBS_SEEKING => self.seeking.set(flag),
+                        OBS_DURATION => self.duration.set(num),
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
