@@ -1,0 +1,32 @@
+# Third-party programs bundled with cheapedit, pinned to exact files.
+#
+# tools\fetch-deps.ps1 downloads each file into target\deps-cache, refuses it
+# unless its SHA-256 matches the value here, and lays out target\deps\ (what
+# the installer ships as {app}\deps\). Dev builds use target\deps\ too.
+#
+# To upgrade: change the version and URLs, then run
+#   .\tools\fetch-deps.ps1 -Pin
+# which downloads the new files and writes their SHA-256 values below.
+# Check the release notes and run the tests before committing the new pins.
+#
+# Both are GPL. The source archives are attached to every cheapedit release
+# (tools\release.ps1), which is how cheapedit offers the source for them.
+
+[ffmpeg]
+version = "9.0.2"
+build = "Gyan full_build-shared"
+url = "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-full_build-shared.zip"
+sha256 = "8d31e162f1616e37aab3fa2db991b97e1b8dbeb1c8465fd81a81be16ff91b328"
+# The exact FFmpeg commit Gyan built (see the release notes).
+source_url = "https://github.com/FFmpeg/FFmpeg/archive/946fcce07b6dcd0331c8cc609192aeff5e1924f8.tar.gz"
+source_name = "ffmpeg-9.0.2-source.tar.gz"
+source_sha256 = "0aa2b1de2a5698b20a23e93d539a9a8e82ca0117496c5bdf05d198805f42bb3b"
+
+[libmpv]
+version = "20261111-git-bcde6b93cc"
+build = "shinchiro mpv-dev x86_64"
+url = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z"
+sha256 = "273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452"
+source_url = "https://github.com/mpv-player/mpv/archive/bcde6b93cca4d128d84e1a60d1a6db2cd81c889e.tar.gz"
+source_name = "mpv-20261111-git-bcde6b93cc-source.tar.gz"
+source_sha256 = "d87d17a4a6fde0c963db1425cae6d4b413788bb935353d3cfedb376acd15cd5f"

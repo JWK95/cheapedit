@@ -1,14 +1,16 @@
-# Setting up cheapedit's tools
+# Using your own FFmpeg and libmpv
 
-cheapedit is a front end. **FFmpeg** does all the editing and **libmpv** plays the video. You install them once, system-wide, so every tool on your PC shares the same up-to-date copy. cheapedit checks for them every time it starts and shows these same steps on its setup screen.
+cheapedit is a front end. **FFmpeg** does all the editing and **libmpv** plays the video. **cheapedit comes with its own copies of both**, in the `deps` folder where it's installed, so you don't need this guide to use it.
 
-All three are required:
+This guide is for people who'd rather use their own copies, installed once for the whole PC and kept up to date themselves. To use them, turn on **Use my own FFmpeg and libmpv from PATH** on cheapedit's **Setup** screen. If one of yours is missing or broken, cheapedit falls back to its bundled copy. The setup screen shows the same steps.
+
+All three are needed:
 
 - **FFmpeg** (version 6.0 or newer)
 - **ffprobe**, which comes with FFmpeg
 - **libmpv-2.dll**
 
-cheapedit never installs anything or changes your PATH itself.
+cheapedit never changes your PATH itself, and its bundled copies are never added to it.
 
 ---
 

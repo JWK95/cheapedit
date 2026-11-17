@@ -73,21 +73,6 @@ pub fn format_compact(seconds: f64) -> String {
     }
 }
 
-/// Compact form for file names, e.g. `25`, `25.5`, `1m05s`, `1h02m03s`.
-pub fn format_for_filename(seconds: f64) -> String {
-    let whole = seconds.floor() as u64;
-    let frac = ((seconds - whole as f64) * 10.0).round() as u64;
-    let (h, m, s) = (whole / 3600, (whole / 60) % 60, whole % 60);
-    let secs = if frac > 0 && frac < 10 { format!("{s}.{frac}") } else { format!("{s}") };
-    if h > 0 {
-        format!("{h}h{m:02}m{s:02}s")
-    } else if m > 0 {
-        format!("{m}m{:0>2}s", secs)
-    } else {
-        secs
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,8 +105,5 @@ mod tests {
         assert_eq!(format_compact(25.5), "25.5");
         assert_eq!(format_compact(65.25), "1:05.25");
         assert_eq!(parse(&format_compact(3723.4)).unwrap(), 3723.4);
-        assert_eq!(format_for_filename(25.0), "25");
-        assert_eq!(format_for_filename(25.5), "25.5");
-        assert_eq!(format_for_filename(65.0), "1m05s");
     }
 }

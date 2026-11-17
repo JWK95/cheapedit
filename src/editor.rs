@@ -1,5 +1,7 @@
 //! The main editor screen: preview on the left, tools on the right.
 
+use crate::clips;
+use crate::discord::{self, Plan, Preset};
 use crate::export::{Export, Outcome};
 use crate::formats::{ACodec, Caps, Container, VCodec};
 use crate::job::{self, AvMode, CutMode, EncSpeed, FrameRate, Job, Options, Quality, Resolution};
@@ -151,6 +153,22 @@ pub struct Editor {
     /// Paused last frame, and where; a pause-to-play change sets the ghost.
     was_paused: bool,
     paused_pos: f64,
+    /// The Clips drawer's file list.
+    library: clips::Library,
+    /// The running export's size cap, and whether it's already the retry.
+    export_cap: Option<(u64, bool)>,
+    /// A short message after Copy file ("Copied" or what went wrong).
+    copy_note: Option<(String, Instant)>,
+    /// The drawer's Finished files list: the output folder.
+    finished: clips::Library,
+    /// Which sources have been exported (green ticks).
+    history: crate::history::History,
+    /// The file just exported, highlighted in Finished for a few seconds.
+    fresh: Option<(PathBuf, Instant)>,
+    /// (clips folder, output folder) the drawer lists were last scanned for.
+    lists_for: Option<(Option<PathBuf>, Option<PathBuf>)>,
+    /// A Discord export that's still over its cap after the retry.
+    over_cap: Option<String>,
 }
 
 impl Editor {
@@ -216,6 +234,14 @@ impl Editor {
             ghost: None,
             was_paused: true,
             paused_pos: 0.0,
+            library: clips::Library::default(),
+            export_cap: None,
+            copy_note: None,
+            finished: clips::Library::default(),
+            history: crate::history::History::load(),
+            fresh: None,
+            lists_for: None,
+            over_cap: None,
         }
     }
 
@@ -250,6 +276,12 @@ impl Editor {
     /// (e.g. a file with no audio can't be "audio only").
     fn effective_opts(&self) -> Options {
         let mut o = self.settings.options.clone();
+        if self.discord_active() {
+            o = match self.discord_plan() {
+                Some(Ok(p)) => o.with_plan(&p),
+                _ => o.with_preset_basics(),
+            };
+        }
         if let Some(m) = &self.media {
             if m.video.is_none() {
                 o.av = AvMode::AudioOnly;
@@ -258,6 +290,23 @@ impl Editor {
             }
         }
         o
+    }
+
+    /// A Discord preset is chosen and applies (the file has a picture).
+    fn discord_active(&self) -> bool {
+        self.settings.options.preset.cap_mb().is_some() && self.media.as_ref().is_none_or(|m| m.video.is_some())
+    }
+
+    /// The Discord preset's plan for the current trim and speed. `Err` holds
+    /// the longest output length (seconds) that fits.
+    fn discord_plan(&self) -> Option<Result<Plan, f64>> {
+        let cap = self.settings.options.preset.cap_bytes()?;
+        let m = self.media.as_ref()?;
+        let v = m.video.as_ref()?;
+        let (s, e) = self.trim()?;
+        let o = &self.settings.options;
+        let has_audio = m.audio.is_some() && !matches!(o.av, AvMode::RemoveAudio | AvMode::Mute);
+        Some(discord::plan(cap, job::output_duration(s, e, o.speed), v.width, v.height, v.fps, has_audio))
     }
 
     /// Zoom works when the export re-encodes a picture.
@@ -285,8 +334,12 @@ impl Editor {
         self.zones.iter().filter_map(Zone::resolve).collect()
     }
 
-    fn zoom_in_name(&self) -> bool {
-        self.zoom_allowed() && !self.zones.is_empty()
+    /// The automatic name: the game (or the source's own name) and the time now.
+    fn auto_name(&self, m: &MediaInfo) -> String {
+        let game = clips::game_for_name(self.settings.clips_dir.as_deref(), &m.path)
+            .unwrap_or_else(|| m.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into()));
+        let name = job::auto_name(&game, winutil::now_stamp());
+        job::sanitize_name(&name).unwrap_or(name)
     }
 
     fn caps(&self) -> Option<Caps> {
@@ -331,9 +384,9 @@ impl Editor {
     fn output_path_preview(&self) -> Option<PathBuf> {
         let dir = self.settings.output_dir.as_ref()?;
         let m = self.media.as_ref()?;
-        let (s, e) = self.trim()?;
+        self.trim()?;
         let o = self.effective_opts();
-        let name = job::sanitize_name(&self.name_text).unwrap_or_else(|| job::auto_name(&m.path, s, e, o.effective_speed(), self.zoom_in_name()));
+        let name = job::sanitize_name(&self.name_text).unwrap_or_else(|| self.auto_name(m));
         Some(job::unique_path(dir, &name, o.output_container().ext()))
     }
 
@@ -348,7 +401,7 @@ impl Editor {
             }
             _ => None,
         };
-        validate::check(&validate::Input {
+        let mut out = validate::check(&validate::Input {
             media: self.media.as_ref(),
             start_text: &self.start_text,
             end_text: &self.end_text,
@@ -359,7 +412,21 @@ impl Editor {
             space,
             dir_writable: self.dir_status.1,
             zones: &self.zones,
-        })
+        });
+        if let Some(Err(max_out)) = self.discord_plan() {
+            // The trim is in original-video time, so scale by the speed.
+            let max_trim = max_out * self.settings.options.speed;
+            out.push(validate::Problem {
+                message: format!(
+                    "Too long for {} ({} MB) even at 480p. Trim it to under {}.",
+                    self.settings.options.preset.label(),
+                    self.settings.options.preset.cap_mb().unwrap_or(0),
+                    timecode::format_short(max_trim)
+                ),
+                fixes: Vec::new(),
+            });
+        }
+        out
     }
 
     pub fn exporting(&self) -> bool {
@@ -444,13 +511,29 @@ impl Editor {
     }
 
     fn start_export(&mut self, ctx: &egui::Context) {
+        self.start_export_scaled(ctx, None);
+    }
+
+    /// `retry`: re-encode after a capped export came out too big, into the
+    /// same file, with the video bitrate scaled by the factor.
+    fn start_export_scaled(&mut self, ctx: &egui::Context, retry: Option<(f64, PathBuf)>) {
         if self.exporting() || !self.problems().is_empty() {
             return;
         }
-        let (Some(m), Some((start, end)), Some(out), Some(caps)) = (self.media.clone(), self.trim(), self.output_path_preview(), self.caps()) else {
+        let out = match &retry {
+            Some((_, p)) => Some(p.clone()),
+            None => self.output_path_preview(),
+        };
+        let (Some(m), Some((start, end)), Some(out), Some(caps)) = (self.media.clone(), self.trim(), out, self.caps()) else {
             return;
         };
-        let o = self.effective_opts();
+        let retry = retry.map(|r| r.0);
+        let mut o = self.effective_opts();
+        let cap = if self.discord_active() { o.preset.cap_bytes() } else { None };
+        if let Some(f) = retry {
+            o.custom_kbps = ((o.custom_kbps as f64 * f) as u32).max(100);
+            self.log.info(format!("Re-encoding at {} kbps video so it fits under {} MB.", o.custom_kbps, o.preset.cap_mb().unwrap_or(0)));
+        }
         let encodes_video = o.mode == CutMode::Precise && o.av != AvMode::AudioOnly && m.video.is_some();
         let enc = if encodes_video { caps.pick(o.vcodec, o.use_gpu) } else { None };
         let zones = self.active_zones();
@@ -467,13 +550,54 @@ impl Editor {
             Ok(e) => {
                 self.export = Some(e);
                 self.export_sig = self.export_sig();
+                self.export_cap = cap.map(|c| (c, retry.is_some()));
                 self.last_outcome = None;
+                self.over_cap = None;
             }
             Err(e) => {
                 self.log.error(&e);
                 self.last_outcome = Some((Outcome::Failed(e), out));
             }
         }
+    }
+
+    /// A finished export: check a size cap (re-encoding once if it's over),
+    /// then show the result.
+    fn finish_export(&mut self, ctx: &egui::Context) {
+        let Some(e) = &self.export else { return };
+        let Some(outcome) = e.progress().outcome else { return };
+        let path = e.output.clone();
+        self.export = None;
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if outcome == Outcome::Done {
+            if let Some((cap, false)) = self.export_cap {
+                if bytes > cap {
+                    self.log.info(format!("{} came out at {}, over the {} cap. Trying again smaller.", path.display(), mb(bytes), mb(cap)));
+                    let _ = std::fs::remove_file(&path);
+                    self.start_export_scaled(ctx, Some((discord::retry_scale(cap, bytes), path.clone())));
+                    if self.export.is_some() {
+                        return;
+                    }
+                }
+            }
+            if let Some((cap, _)) = self.export_cap {
+                if bytes > cap {
+                    let msg = format!("Still {} after the retry, over the {} cap. Discord may refuse it.", mb(bytes), mb(cap));
+                    self.log.error(&msg);
+                    self.over_cap = Some(msg);
+                }
+            }
+            self.exported_file = Some(path.clone());
+            self.view = View::Result;
+            if let Some(m) = &self.media {
+                self.history.record(&m.path, winutil::now_stamp());
+                self.history.save();
+            }
+            self.fresh = Some((path.clone(), Instant::now()));
+            self.rescan_lists(ctx);
+        }
+        self.export_cap = None;
+        self.last_outcome = Some((outcome, path));
     }
 
     fn handle_action(&mut self, a: Action, ctx: &egui::Context) {
@@ -749,23 +873,32 @@ impl Editor {
                 self.handle_action(a, &ctx);
             }
         }
-        // Finished export → show the result.
-        if let Some(e) = &self.export {
-            let pr = e.progress();
-            if let Some(outcome) = pr.outcome {
-                if outcome == Outcome::Done {
-                    self.exported_file = Some(e.output.clone());
-                    self.view = View::Result;
-                }
-                self.last_outcome = Some((outcome, e.output.clone()));
-                self.export = None;
-            }
+        self.finish_export(&ctx);
+        if self.library.poll(&ctx) {
+            self.catch_up_history();
         }
+        self.finished.poll(&ctx);
         self.refresh_dir_status();
 
         egui::Panel::top("topbar").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
+                let open = self.settings.clips_open;
+                // The ☰ glyph isn't in egui's built-in fonts, so the icon is drawn:
+                // leading spaces leave room for it.
+                let btn = ui.selectable_label(open, "      Clips");
+                let r = btn.rect;
+                let (x0, x1, cy) = (r.left() + 10.0, r.left() + 24.0, r.center().y);
+                for dy in [-4.5, 0.0, 4.5] {
+                    ui.painter().line_segment([egui::pos2(x0, cy + dy), egui::pos2(x1, cy + dy)], Stroke::new(1.6, theme::TEXT));
+                }
+                if btn.on_hover_text(if open { "Hide the Clips drawer" } else { "Show your clips, grouped by game" }).clicked() {
+                    self.settings.clips_open = !open;
+                    if !open {
+                        self.rescan_lists(&ctx);
+                    }
+                }
+                ui.add_space(4.0);
                 ui.label(RichText::new("cheapedit").strong().size(16.0).color(theme::ACCENT));
                 if winutil::is_dev() {
                     dev_badge(ui);
@@ -805,6 +938,18 @@ impl Editor {
                 ui.add_space(12.0);
             });
         });
+
+        if self.settings.clips_open {
+            let r = egui::Panel::left("clips")
+                .resizable(true)
+                .default_size(self.settings.clips_width)
+                .size_range(190.0..=480.0)
+                .show(ui, |ui| self.clips_ui(ui, frame));
+            let w = r.response.rect.width().round();
+            if (w - self.settings.clips_width).abs() >= 1.0 {
+                self.settings.clips_width = w;
+            }
+        }
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             self.preview_ui(ui, frame);
@@ -1418,9 +1563,9 @@ impl Editor {
 
         // 2. Name
         theme::section(ui, "Output name");
-        let auto = match (&media, self.trim()) {
-            (Some(m), Some((s, e))) => job::auto_name(&m.path, s, e, self.effective_opts().effective_speed(), self.zoom_in_name()),
-            _ => "automatic name".into(),
+        let auto = match &media {
+            Some(m) => self.auto_name(m),
+            None => "automatic name".into(),
         };
         ui.add(egui::TextEdit::singleline(&mut self.name_text).hint_text(auto).desired_width(f32::INFINITY));
         match self.output_path_preview() {
@@ -1459,19 +1604,27 @@ impl Editor {
 
         // 4. Cut mode
         theme::section(ui, "Cut mode");
+        let discord = self.discord_active();
+        let preset = self.settings.options.preset;
         let o = &mut self.settings.options;
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut o.mode, CutMode::Precise, "  Precise  ");
-            ui.selectable_value(&mut o.mode, CutMode::Fast, "  Fast  ");
+        ui.add_enabled_ui(!discord, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut o.mode, CutMode::Precise, "  Precise  ");
+                ui.selectable_value(&mut o.mode, CutMode::Fast, "  Fast  ");
+            });
         });
-        match o.mode {
+        let mode = if discord { CutMode::Precise } else { o.mode };
+        if discord {
+            theme::hint(ui, format!("Set by {}: it always re-encodes, so the file can fit the size.", preset.label()));
+        }
+        match mode {
             CutMode::Precise => theme::hint(ui, "Cuts are exact to the frame. Slower, and quality depends on your settings."),
             CutMode::Fast => theme::hint(
                 ui,
                 "Done in about a second with no quality loss, but the start snaps to the nearest earlier keyframe, so your clip may begin slightly early.",
             ),
         }
-        let fast = o.mode == CutMode::Fast;
+        let fast = mode == CutMode::Fast;
         ui.separator();
 
         // 5. Speed
@@ -1496,15 +1649,28 @@ impl Editor {
         let has_audio = media.as_ref().map(|m| m.audio.is_some()).unwrap_or(true);
         let has_video = media.as_ref().map(|m| m.video.is_some()).unwrap_or(true);
         let o = &mut self.settings.options;
-        let mut av = if !has_video { AvMode::AudioOnly } else if !has_audio { AvMode::Both } else { o.av };
+        let mut av = if !has_video {
+            AvMode::AudioOnly
+        } else if !has_audio || (discord && o.av == AvMode::AudioOnly) {
+            AvMode::Both
+        } else {
+            o.av
+        };
+        let shown = av;
         ui.add_enabled_ui(has_audio && has_video, |ui| {
             egui::ComboBox::from_id_salt("avmode").width(ui.available_width()).selected_text(av.label()).show_ui(ui, |ui| {
                 for m in AvMode::ALL {
-                    ui.selectable_value(&mut av, m, m.label());
+                    let blocked = discord && m == AvMode::AudioOnly;
+                    let r = ui.add_enabled(!blocked, egui::Button::selectable(av == m, m.label()));
+                    if r.clicked() {
+                        av = m;
+                    }
+                    r.on_disabled_hover_text("Not available with Discord presets.");
                 }
             });
         });
-        if has_audio && has_video {
+        // Only a real choice is saved, so a preset never changes your own settings.
+        if has_audio && has_video && av != shown {
             o.av = av;
         }
         if !has_audio {
@@ -1539,13 +1705,27 @@ impl Editor {
         }
         ui.separator();
 
-        // 7. Quality and codec
+        // 7. Quality and codec, with the preset on top
+        theme::section(ui, "Quality and codec");
+        if has_video {
+            ui.horizontal(|ui| {
+                ui.label("Preset");
+                let o = &mut self.settings.options;
+                egui::ComboBox::from_id_salt("preset").width(ui.available_width()).selected_text(o.preset.label()).show_ui(ui, |ui| {
+                    for p in Preset::ALL {
+                        ui.selectable_value(&mut o.preset, p, p.label()).on_hover_text(p.hint());
+                    }
+                });
+            });
+            theme::hint(ui, self.settings.options.preset.hint());
+        }
         if av != AvMode::AudioOnly {
             self.quality_ui(ui, caps.as_ref(), media.as_ref(), fast);
-            ui.separator();
         }
+        ui.separator();
 
-        // 8. Export
+        // 8. Estimate, then Export
+        self.estimate_ui(ui);
         ui.add_space(4.0);
         let problems = self.problems();
         if self.media.is_some() {
@@ -1584,6 +1764,9 @@ impl Editor {
             match outcome {
                 Outcome::Done => {
                     ui.label(RichText::new(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy())).color(theme::OK));
+                    if let Some(n) = &self.over_cap {
+                        theme::warn(ui, n.clone());
+                    }
                     if ui.small_button("Open in folder").clicked() {
                         winutil::reveal_in_explorer(path);
                     }
@@ -1766,8 +1949,21 @@ impl Editor {
         }
     }
 
+    /// Codec and quality controls. With a Discord preset they show the
+    /// preset's choices, greyed out; your own choices come back with Custom.
     fn quality_ui(&mut self, ui: &mut egui::Ui, caps: Option<&Caps>, media: Option<&MediaInfo>, fast: bool) {
-        theme::section(ui, "Quality and codec");
+        let discord = self.discord_active();
+        let shown = self.effective_opts();
+        let saved = discord.then(|| std::mem::replace(&mut self.settings.options, shown));
+        let label = self.settings.options.preset.label();
+        ui.add_enabled_ui(!discord, |ui| self.quality_body(ui, caps, media, fast));
+        if let Some(s) = saved {
+            self.settings.options = s;
+            theme::hint(ui, format!("Set by {label}. Choose Custom to change these."));
+        }
+    }
+
+    fn quality_body(&mut self, ui: &mut egui::Ui, caps: Option<&Caps>, media: Option<&MediaInfo>, fast: bool) {
         let o = &mut self.settings.options;
 
         // Format: always available (also in Fast mode).
@@ -1947,6 +2143,258 @@ impl Editor {
         let _ = VCodec::H264;
     }
 
+    fn drag_out(&mut self, frame: &eframe::Frame, path: &Path, ctx: &egui::Context) {
+        if let Err(e) = winutil::drag_file_out(frame, path) {
+            self.log.error(&e);
+        }
+        // Windows ran the drag itself, so egui never saw the button come up.
+        ctx.stop_dragging();
+    }
+
+    fn copy_file(&mut self, path: &Path) {
+        let note = match winutil::copy_file_to_clipboard(path) {
+            Ok(()) => "Copied. Paste it with Ctrl+V".to_string(),
+            Err(e) => {
+                self.log.error(&e);
+                e
+            }
+        };
+        self.copy_note = Some((note, Instant::now()));
+    }
+
+    /// Size, resolution, frame rate and bitrates the export will come out at.
+    fn estimate_ui(&self, ui: &mut egui::Ui) {
+        let (Some(m), Some((s, e))) = (self.media.as_ref(), self.trim()) else { return };
+        let o = self.effective_opts();
+        let out = PathBuf::new();
+        let j = Job { media: m, opts: &o, start: s, end: e, output: &out, video_encoder: None, can_tonemap: false, zones: &[] };
+        let est = job::estimate(&j);
+        let dur = job::output_duration(s, e, o.effective_speed());
+        let plan = if self.discord_active() { self.discord_plan().and_then(Result::ok) } else { None };
+        let cap = self.settings.options.preset;
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Estimate").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match &plan {
+                    Some(p) => {
+                        ui.label(RichText::new(format!("fits under {} MB", cap.cap_mb().unwrap_or(0))).small().color(theme::OK));
+                        ui.label(RichText::new(mb(p.bytes(dur))).strong().size(15.0));
+                    }
+                    None => {
+                        ui.label(RichText::new(format!("≈ {}", validate::bytes(est.bytes))).strong().size(15.0));
+                    }
+                });
+            });
+            egui::Grid::new("estimate").num_columns(2).spacing(egui::vec2(12.0, 2.0)).show(ui, |ui| {
+                let row = |ui: &mut egui::Ui, k: &str, v: String| {
+                    ui.label(RichText::new(k).small().color(theme::MUTED));
+                    ui.label(RichText::new(v).small());
+                    ui.end_row();
+                };
+                if let Some((w, h)) = est.size {
+                    row(ui, "Resolution", format!("{w}×{h}"));
+                }
+                if let Some(f) = est.fps {
+                    row(ui, "Frame rate", format!("{} fps", probe::fmt_fps(f)));
+                }
+                if est.video_copied {
+                    row(ui, "Video", "copied as it is".into());
+                } else if let Some(k) = est.video_kbps {
+                    row(ui, "Video", if est.exact_bitrate { kbps(k) } else { format!("≈ {}", kbps(k)) });
+                }
+                match est.audio_kbps {
+                    Some(k) => row(ui, "Audio", kbps(k)),
+                    None if m.audio.is_none() || o.av == AvMode::RemoveAudio => row(ui, "Audio", "none".into()),
+                    None if o.av == AvMode::Mute => row(ui, "Audio", "silent track".into()),
+                    None if o.mode == CutMode::Fast => row(ui, "Audio", "copied as it is".into()),
+                    None => row(ui, "Audio", "lossless".into()),
+                }
+            });
+            if plan.is_some() {
+                theme::hint(ui, "Picked to fit the size. Longer clips step down from 1080p60 to 1080p30, 720p30, then 480p30.");
+            } else if !est.exact_bitrate && !est.video_copied {
+                theme::hint(ui, "A rough guess: the real size depends on how busy the video is.");
+            }
+        });
+    }
+
+    fn choose_clips_folder(&mut self, ctx: &egui::Context) {
+        let mut d = rfd::FileDialog::new().set_title("Choose the folder your clips are saved in");
+        if let Some(dir) = self.settings.clips_dir.as_ref().or(self.settings.last_open_dir.as_ref()) {
+            d = d.set_directory(dir);
+        }
+        if let Some(p) = d.pick_folder() {
+            self.settings.clips_dir = Some(p);
+            self.rescan_lists(ctx);
+        }
+    }
+
+    /// Rescan both drawer lists: Editing (the clips folder and its subfolders,
+    /// minus the output folder) and Finished (the output folder itself).
+    fn rescan_lists(&mut self, ctx: &egui::Context) {
+        let (clips_dir, out_dir) = (self.settings.clips_dir.clone(), self.settings.output_dir.clone());
+        if let Some(dir) = &clips_dir {
+            self.library.rescan(dir, clips::ScanOpts { flat: false, exclude: out_dir.clone() }, ctx);
+        }
+        if let Some(dir) = &out_dir {
+            self.finished.rescan(dir, clips::ScanOpts { flat: true, exclude: None }, ctx);
+        }
+        self.lists_for = Some((clips_dir, out_dir));
+    }
+
+    /// Once, when history is first kept: mark sources that already have an
+    /// old-style export (`<source name>_…`) in the output folder.
+    fn catch_up_history(&mut self) {
+        if self.history.caught_up {
+            return;
+        }
+        let Some(out) = self.settings.output_dir.clone() else { return };
+        let exports: Vec<(String, Option<job::Stamp>)> = clips::scan(&out, &clips::ScanOpts { flat: true, exclude: None })
+            .into_iter()
+            .flat_map(|g| g.clips)
+            .map(|c| (c.name, winutil::local_stamp(c.modified)))
+            .collect();
+        let found = self.history.catch_up(self.library.all(), &exports);
+        self.history.save();
+        self.log.info(format!("Export history started: {found} clip(s) already had exports in the output folder."));
+    }
+
+    /// The drawer: Editing files on top, Finished files below, with a
+    /// divider you can drag between them.
+    fn clips_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let want = (self.settings.clips_dir.clone(), self.settings.output_dir.clone());
+        if self.lists_for.as_ref() != Some(&want) {
+            self.rescan_lists(&ctx);
+        }
+        let w = ui.available_width();
+        let total = ui.available_height();
+        let top_y = ui.cursor().top();
+        const DIVIDER: f32 = 10.0;
+        let top_h = ((total - DIVIDER) * self.settings.clips_split.clamp(0.15, 0.85)).round();
+        ui.allocate_ui_with_layout(egui::vec2(w, top_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_size(egui::vec2(w, top_h));
+            self.editing_half(ui, &ctx);
+        });
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(w, DIVIDER), Sense::drag());
+        let col = if resp.hovered() || resp.dragged() { theme::ACCENT } else { theme::BORDER };
+        ui.painter().line_segment([egui::pos2(r.left(), r.center().y), egui::pos2(r.right(), r.center().y)], Stroke::new(if resp.dragged() { 2.0 } else { 1.0 }, col));
+        let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text("Drag to resize");
+        // Follow the pointer itself, so the divider stays under the cursor
+        // (adding up small per-frame moves lost them to rounding).
+        if let (true, Some(p)) = (resp.dragged(), resp.interact_pointer_pos()) {
+            let f = (p.y - top_y - DIVIDER / 2.0) / (total - DIVIDER).max(1.0);
+            self.settings.clips_split = f.clamp(0.15, 0.85);
+            ctx.request_repaint();
+        }
+        let bottom_h = ui.available_height();
+        ui.allocate_ui_with_layout(egui::vec2(w, bottom_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_size(egui::vec2(w, bottom_h));
+            self.finished_half(ui, frame, &ctx);
+        });
+    }
+
+    /// A drawer half's heading, Refresh button and folder line.
+    fn half_header(&mut self, ui: &mut egui::Ui, title: &str, dir: Option<&Path>, scanning: bool, ctx: &egui::Context) -> bool {
+        let mut change = false;
+        ui.horizontal(|ui| {
+            theme::section(ui, title);
+            if dir.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Refresh").on_hover_text("Look for new files").clicked() {
+                        self.rescan_lists(ctx);
+                    }
+                    if scanning {
+                        ui.spinner();
+                    }
+                });
+            }
+        });
+        if let Some(dir) = dir {
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 64.0;
+                ui.allocate_ui_with_layout(egui::vec2(w, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(dir.display().to_string()).monospace().small().color(theme::MUTED)).truncate())
+                        .on_hover_text(dir.display().to_string());
+                });
+                change = ui.small_button("Change").clicked();
+            });
+        }
+        change
+    }
+
+    fn editing_half(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let dir = self.settings.clips_dir.clone();
+        if self.half_header(ui, "Editing files", dir.as_deref(), self.library.scanning(), ctx) {
+            self.choose_clips_folder(ctx);
+        }
+        if dir.is_none() {
+            theme::hint(ui, "Choose the folder your game clips are saved in, for example Videos\\NVIDIA. Clips are grouped by game, newest first.");
+            if ui.button("Choose clips folder").clicked() {
+                self.choose_clips_folder(ctx);
+            }
+            return;
+        }
+        if self.library.groups.is_empty() {
+            theme::hint(ui, if self.library.scanning() { "Looking for clips…" } else { "No videos in this folder yet." });
+            return;
+        }
+        let current = self.media.as_ref().map(|m| m.path.clone());
+        let list = ClipList { id: "editing", current: current.as_deref(), history: Some(&self.history), fresh: None, draggable: false };
+        let act = list.show(ui, &self.library);
+        self.do_list_actions(act, None, ctx);
+    }
+
+    fn finished_half(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, ctx: &egui::Context) {
+        let dir = self.settings.output_dir.clone();
+        if self.half_header(ui, "Finished files", dir.as_deref(), self.finished.scanning(), ctx) {
+            self.choose_folder();
+        }
+        if let Some((note, at)) = &self.copy_note {
+            if at.elapsed() < Duration::from_secs(4) {
+                ui.label(RichText::new(note).small().color(theme::OK));
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
+        if dir.is_none() {
+            theme::hint(ui, "Your exports show here. Choose the output folder they're saved to.");
+            if ui.button("Choose output folder").clicked() {
+                self.choose_folder();
+            }
+            return;
+        }
+        if self.finished.groups.is_empty() {
+            theme::hint(ui, if self.finished.scanning() { "Looking…" } else { "Nothing exported yet." });
+            return;
+        }
+        let fresh = self.fresh.as_ref().filter(|(_, at)| at.elapsed() < Duration::from_secs(5)).map(|(p, at)| (p.clone(), *at));
+        if fresh.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        let current = self.media.as_ref().map(|m| m.path.clone());
+        let list = ClipList { id: "finished", current: current.as_deref(), history: None, fresh: fresh.as_ref().map(|(p, at)| (p.as_path(), *at)), draggable: true };
+        let act = list.show(ui, &self.finished);
+        self.do_list_actions(act, Some(frame), ctx);
+    }
+
+    fn do_list_actions(&mut self, act: ListActions, frame: Option<&eframe::Frame>, ctx: &egui::Context) {
+        if let (Some(p), Some(frame)) = (act.drag, frame) {
+            self.drag_out(frame, &p, ctx);
+        }
+        if let Some(p) = act.open {
+            if self.media.as_ref().map(|m| &m.path) != Some(&p) {
+                self.open(p);
+            }
+        }
+        if let Some(p) = act.reveal {
+            winutil::reveal_in_explorer(&p);
+        }
+        if let Some(p) = act.copy {
+            self.copy_file(&p);
+        }
+    }
+
     fn log_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_log;
         egui::Window::new("Log").open(&mut open).default_size([760.0, 360.0]).resizable(true).show(ctx, |ui| {
@@ -2022,4 +2470,135 @@ pub fn key_cap(ui: &mut egui::Ui, text: &str) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).small().monospace());
         });
+}
+
+/// What the user did in a drawer list this frame.
+#[derive(Default)]
+struct ListActions {
+    open: Option<PathBuf>,
+    drag: Option<PathBuf>,
+    reveal: Option<PathBuf>,
+    copy: Option<PathBuf>,
+}
+
+/// A drawer list: files grouped by game, newest first.
+struct ClipList<'a> {
+    id: &'static str,
+    /// The file open in the editor (highlighted).
+    current: Option<&'a Path>,
+    /// Ticks for sources that have been exported (Editing list only).
+    history: Option<&'a crate::history::History>,
+    /// The file just exported, and when (Finished list only).
+    fresh: Option<(&'a Path, Instant)>,
+    /// Rows can be dragged out to other apps (Finished list only).
+    draggable: bool,
+}
+
+impl ClipList<'_> {
+    fn show(&self, ui: &mut egui::Ui, lib: &clips::Library) -> ListActions {
+        let mut act = ListActions::default();
+        let now = std::time::SystemTime::now();
+        egui::ScrollArea::vertical().id_salt(self.id).auto_shrink(false).show(ui, |ui| {
+            for g in &lib.groups {
+                let holds_fresh = self.fresh.is_some_and(|(p, _)| g.clips.iter().any(|c| c.path == p));
+                let mut header = egui::CollapsingHeader::new(RichText::new(format!("{}  ({})", g.game, g.clips.len())).strong())
+                    .id_salt((self.id, &g.game))
+                    .default_open(true);
+                if holds_fresh {
+                    header = header.open(Some(true));
+                }
+                header.show(ui, |ui| {
+                    for c in &g.clips {
+                        let tick = self.history.and_then(|h| h.get(&c.path)).map(crate::history::describe);
+                        let fresh = self.fresh.filter(|(p, _)| *p == c.path).map(|(_, at)| at);
+                        let resp = self.row(ui, c, now, tick);
+                        if let Some(at) = fresh {
+                            // Fade the highlight out over a few seconds.
+                            let a = (1.0 - at.elapsed().as_secs_f32() / 5.0).clamp(0.0, 1.0);
+                            ui.painter().rect_stroke(resp.rect, 4.0, Stroke::new(2.0, theme::OK.gamma_multiply(a)), egui::StrokeKind::Inside);
+                            if at.elapsed() < Duration::from_millis(300) {
+                                resp.scroll_to_me(Some(egui::Align::Center));
+                            }
+                        }
+                        if self.draggable && resp.drag_started() {
+                            act.drag = Some(c.path.clone());
+                        } else if resp.clicked() {
+                            act.open = Some(c.path.clone());
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Show in folder").clicked() {
+                                act.reveal = Some(c.path.clone());
+                                ui.close();
+                            }
+                            if ui.button("Copy file").on_hover_text("Then press Ctrl+V in Discord or Explorer").clicked() {
+                                act.copy = Some(c.path.clone());
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        act
+    }
+
+    /// One file: name (and a green tick if it's been exported), then
+    /// "2 h ago · 45 MB".
+    fn row(&self, ui: &mut egui::Ui, c: &clips::Clip, now: std::time::SystemTime, tick: Option<String>) -> egui::Response {
+        let current = self.current == Some(c.path.as_path());
+        let w = ui.available_width();
+        let sense = if self.draggable { Sense::click_and_drag() } else { Sense::click() };
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 36.0), sense);
+        let painter = ui.painter_at(rect);
+        if current {
+            painter.rect_filled(rect, 4.0, theme::ACCENT_DIM.gamma_multiply(0.6));
+        } else if resp.hovered() {
+            painter.rect_filled(rect, 4.0, theme::CARD);
+        }
+        let pad = 6.0;
+        let tick_w = if tick.is_some() { 20.0 } else { 0.0 };
+        // One line only: cut long names with an ellipsis.
+        let mut job = egui::text::LayoutJob::simple_singleline(c.name.clone(), egui::FontId::proportional(13.0), if current { Color32::WHITE } else { theme::TEXT });
+        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - pad * 2.0 - tick_w);
+        let name = ui.fonts_mut(|f| f.layout_job(job));
+        painter.galley(rect.left_top() + egui::vec2(pad, 3.0), name, theme::TEXT);
+        let sub = format!("{} · {}", clips::relative_time(c.modified, now), validate::bytes(c.size));
+        painter.text(rect.left_bottom() + egui::vec2(pad, -3.0), egui::Align2::LEFT_BOTTOM, sub, egui::FontId::proportional(11.5), theme::MUTED);
+        let how = if self.draggable { "Click to open · drag into another app · right-click for more" } else { "Click to open · right-click for more" };
+        let resp = resp.on_hover_cursor(if self.draggable { egui::CursorIcon::Grab } else { egui::CursorIcon::PointingHand });
+        if let Some(t) = tick {
+            let tr = egui::Rect::from_center_size(egui::pos2(rect.right() - pad - 7.0, rect.top() + 11.0), egui::vec2(16.0, 16.0));
+            check_mark(&painter, tr, theme::OK);
+            // The tick has its own tooltip; it sits on top of the row.
+            ui.interact(tr, ui.scope_id().with((self.id, "tick", &c.path)), Sense::hover()).on_hover_text(t);
+        }
+        resp.on_hover_text(format!("{}\n{how}", c.path.display()))
+    }
+}
+
+/// A tick drawn with lines. egui's built-in fonts have no check-mark glyph
+/// (it would show as an empty box), so it's painted instead.
+fn check_mark(painter: &egui::Painter, r: egui::Rect, color: Color32) {
+    let p = |x: f32, y: f32| egui::pos2(r.left() + x * r.width(), r.top() + y * r.height());
+    let stroke = Stroke::new(2.0, color);
+    painter.line_segment([p(0.15, 0.55), p(0.4, 0.8)], stroke);
+    painter.line_segment([p(0.4, 0.8), p(0.88, 0.22)], stroke);
+}
+
+/// 3552 → "3,552 kbps".
+fn kbps(k: u32) -> String {
+    let s = k.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    format!("{out} kbps")
+}
+
+/// Bytes as megabytes with one decimal, e.g. "8.4 MB".
+fn mb(b: u64) -> String {
+    format!("{:.1} MB", b as f64 / 1e6)
 }

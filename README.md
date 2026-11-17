@@ -12,7 +12,9 @@ A lightweight Windows front end for FFmpeg. You can:
 
 ## Requirements
 
-cheapedit needs **FFmpeg 6+**, **ffprobe** and **libmpv** on your PATH. The first time you open the app, it checks for them and walks you through any setup that's needed. The same steps are in [SETUP.md](SETUP.md).
+Just Windows 10 or 11 (64-bit). cheapedit comes with its own **FFmpeg** and **libmpv**, so there's nothing else to install.
+
+Prefer to use your own copies, to update them yourself? Turn on **Use my own FFmpeg and libmpv from PATH** on the **Setup** screen. [SETUP.md](SETUP.md) shows how to install them properly.
 
 ## Installing
 
@@ -26,7 +28,7 @@ cheapedit isn't code-signed yet. A signing certificate costs money every year, s
 
 ## Privacy
 
-The only time cheapedit goes online is one update check when it starts. It asks github.com for the latest version number and sends nothing about you or your videos. You can turn it off under **About**. cheapedit doesn't install anything else on your system and doesn't change any system settings.
+The only time cheapedit goes online is one update check when it starts. It asks github.com for the latest version number and sends nothing about you or your videos. You can turn it off under **About**. cheapedit doesn't install anything else on your system and doesn't change any system settings. Its bundled FFmpeg and libmpv stay inside its own folder and are never added to PATH.
 
 ## Developing
 
@@ -39,6 +41,8 @@ The only time cheapedit goes online is one update check when it starts. It asks 
 
 The dev build shows a **DEV** badge, keeps its own settings and logs in `%APPDATA%\cheapedit-dev`, and never checks for updates, so it can't interfere with the installed copy.
 
+**Bundled FFmpeg and libmpv:** `tools\deps.toml` pins the exact builds (and their source) by SHA-256. `.\tools\fetch-deps.ps1` downloads and checks them into `target\deps`; `dev.ps1` runs it for you the first time. To upgrade, edit the versions and URLs in `deps.toml`, run `.\tools\fetch-deps.ps1 -Pin`, then run the tests (the `--ignored` ones export with the bundled FFmpeg).
+
 **Release:**
 
 ```powershell
@@ -47,10 +51,11 @@ The dev build shows a **DEV** badge, keeps its own settings and logs in `%APPDAT
 
 This one command:
 
-1. Runs the tests.
-2. Builds the exe, the installer and its SHA-256 checksum.
-3. Commits, tags and pushes.
-4. Publishes a GitHub release.
+1. Fetches and checks the pinned FFmpeg and libmpv.
+2. Runs the tests.
+3. Builds the exe, the installer (about 100 MB, with FFmpeg and libmpv inside) and its SHA-256 checksum.
+4. Commits, tags and pushes.
+5. Publishes a GitHub release, with the FFmpeg and mpv source archives attached.
 
 Installed copies pick the release up on their next start.
 
@@ -63,3 +68,11 @@ cargo run --example make_icon                # regenerate icons from assets/icon
 ```
 
 `tools/verify_combos.ps1` re-checks which format and codec combinations your FFmpeg build accepts.
+
+## Licence
+
+cheapedit is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
+
+Copyright (C) 2026 JWK95
+
+cheapedit includes [FFmpeg](https://ffmpeg.org) (Gyan's builds) and [libmpv](https://mpv.io) (shinchiro's builds), both under the GNU GPL. Their licences are in the `deps\licenses` folder of an install, and the exact source code for the bundled builds is attached to every [release](https://github.com/JWK95/cheapedit/releases).

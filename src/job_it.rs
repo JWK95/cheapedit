@@ -6,8 +6,12 @@ use crate::job::*;
 use crate::probe;
 use std::path::{Path, PathBuf};
 
+/// The FFmpeg the app would use: the bundled copy (target\deps, from
+/// tools\fetch-deps.ps1), or PATH if there isn't one.
 fn tool(name: &str) -> PathBuf {
-    crate::winutil::find_on_path(name).expect("ffmpeg/ffprobe must be on PATH")
+    let p = crate::deps::find(name).expect("run tools\\fetch-deps.ps1, or put FFmpeg on PATH");
+    println!("using {}", p.display());
+    p
 }
 
 fn make_source(ffmpeg: &Path, dir: &Path, name: &str, extra: &[&str]) -> PathBuf {
@@ -165,4 +169,66 @@ fn zoom_zones_export() {
         let v = info.video.unwrap();
         assert_eq!((v.width, v.height), (640, 360), "zoom keeps the size");
     }
+}
+
+/// Discord presets land under their cap on hard-to-compress footage, with
+/// both the CPU and (if present) the GPU encoder. Set CHEAPEDIT_DISCORD_SRC
+/// to test on a real clip instead of generated noise.
+#[test]
+#[ignore]
+fn discord_presets_fit() {
+    let (ffmpeg, ffprobe) = (tool("ffmpeg.exe"), tool("ffprobe.exe"));
+    let caps = Caps::detect(&ffmpeg);
+    let dir = std::env::temp_dir().join("cheapedit-discord-it");
+    let _ = std::fs::create_dir_all(&dir);
+    let src = match std::env::var_os("CHEAPEDIT_DISCORD_SRC") {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let out = dir.join("noisy.mp4");
+            let st = crate::winutil::hidden_command(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=60:d=40,noise=alls=30:allf=t", "-f", "lavfi", "-i", "sine=f=440:d=40", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-c:a", "aac"])
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            out
+        }
+    };
+    let m = probe::probe(&ffprobe, &src).unwrap();
+    let v = m.video.as_ref().unwrap();
+    let mut failures = Vec::new();
+    for (preset, secs) in [(crate::discord::Preset::Discord10, 12.0_f64), (crate::discord::Preset::Discord10, 35.0), (crate::discord::Preset::Discord20, 30.0)] {
+        let secs: f64 = secs.min(m.duration - 1.0);
+        let cap = preset.cap_bytes().unwrap();
+        let plan = crate::discord::plan(cap, secs, v.width, v.height, v.fps, m.audio.is_some()).unwrap();
+        let o = Options { preset, ..Default::default() }.with_plan(&plan);
+        for gpu in [false, true] {
+            let Some(enc) = caps.pick(o.vcodec, gpu) else { continue };
+            if gpu && !enc.contains('_') {
+                continue;
+            }
+            let out = dir.join(format!("d_{}_{secs}_{enc}.mp4", preset.cap_mb().unwrap()));
+            let _ = std::fs::remove_file(&out);
+            let job = Job { media: &m, opts: &o, start: 0.5, end: 0.5 + secs, output: &out, video_encoder: Some(enc), can_tonemap: caps.zscale, zones: &[] };
+            let res = crate::winutil::hidden_command(&ffmpeg).args(build_args(&job)).output().unwrap();
+            assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
+            let bytes = std::fs::metadata(&out).unwrap().len();
+            let line = format!(
+                "{} {secs}s {enc}: {}p{} {}k+{:?}k -> {:.2} MB (plan {:.2} MB, cap {} MB)",
+                preset.label(),
+                plan.height,
+                plan.fps,
+                plan.video_kbps,
+                plan.audio_kbps,
+                bytes as f64 / 1e6,
+                plan.bytes(secs) as f64 / 1e6,
+                preset.cap_mb().unwrap()
+            );
+            println!("{line}");
+            if bytes > cap {
+                failures.push(line);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "over the cap on the first pass:\n{}", failures.join("\n"));
 }

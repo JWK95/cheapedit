@@ -143,6 +143,84 @@ pub fn open_folder(dir: &Path) {
     let _ = Command::new("explorer").arg(dir).spawn();
 }
 
+/// A moment in this PC's local time (with its time zone and daylight saving).
+pub fn local_stamp(t: std::time::SystemTime) -> Option<crate::job::Stamp> {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    // FILETIME counts 100 ns steps since 1601.
+    let ticks = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64 / 100 + 116_444_736_000_000_000;
+    let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let mut utc: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    let mut local: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe {
+        if FileTimeToSystemTime(&ft, &mut utc) == 0 || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0 {
+            return None;
+        }
+    }
+    Some(crate::job::Stamp { year: local.wYear, month: local.wMonth as u8, day: local.wDay as u8, hour: local.wHour as u8, minute: local.wMinute as u8 })
+}
+
+/// The local time now.
+pub fn now_stamp() -> crate::job::Stamp {
+    local_stamp(std::time::SystemTime::now()).unwrap_or(crate::job::Stamp { year: 2000, month: 1, day: 1, hour: 0, minute: 0 })
+}
+
+/// Put a file on the clipboard the way Explorer's Copy does (CF_HDROP),
+/// so Ctrl+V pastes the file itself into Discord, Explorer, a browser…
+pub fn copy_file_to_clipboard(file: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    use windows_sys::Win32::UI::Shell::DROPFILES;
+    const CF_HDROP: u32 = 15;
+
+    if !file.is_file() {
+        return Err("That file isn't there any more.".into());
+    }
+    let file = std::path::absolute(file).map_err(|_| "That file isn't there any more.".to_string())?;
+    let plain = file.to_string_lossy().into_owned();
+    let wide: Vec<u16> = std::ffi::OsStr::new(&plain).encode_wide().chain([0, 0]).collect();
+    let header = std::mem::size_of::<DROPFILES>();
+    unsafe {
+        let mem = GlobalAlloc(GMEM_MOVEABLE, header + wide.len() * 2);
+        if mem.is_null() {
+            return Err("Windows ran out of memory for the clipboard.".into());
+        }
+        let ptr = GlobalLock(mem) as *mut u8;
+        if ptr.is_null() {
+            GlobalFree(mem);
+            return Err("Couldn't use the clipboard.".into());
+        }
+        let df = ptr as *mut DROPFILES;
+        std::ptr::write_bytes(ptr, 0, header);
+        (*df).pFiles = header as u32;
+        (*df).fWide = 1;
+        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr.add(header), wide.len() * 2);
+        GlobalUnlock(mem);
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            GlobalFree(mem);
+            return Err("Another app is using the clipboard. Try again.".into());
+        }
+        EmptyClipboard();
+        let ok = !SetClipboardData(CF_HDROP, mem).is_null();
+        CloseClipboard();
+        if !ok {
+            GlobalFree(mem);
+            return Err("Couldn't put the file on the clipboard.".into());
+        }
+    }
+    Ok(())
+}
+
+/// Start dragging a file out of the window, as if from Explorer. Blocks
+/// until it's dropped (Windows runs its own loop meanwhile). Must be
+/// called while the left mouse button is held down.
+pub fn drag_file_out(window: &impl raw_window_handle::HasWindowHandle, file: &Path) -> Result<(), String> {
+    drag::start_drag(window, drag::DragItem::Files(vec![file.to_path_buf()]), drag::Image::Raw(Vec::new()), |_, _| {}, drag::Options::default())
+        .map_err(|e| format!("Couldn't start dragging: {e}"))
+}
+
 /// True for development builds (`cargo build` / `cargo run`, no `--release`).
 /// Dev builds keep their own settings and logs and never check for updates,
 /// so testing never disturbs the installed copy.

@@ -1,9 +1,12 @@
 #![windows_subsystem = "windows"]
 
+mod clips;
 mod deps;
+mod discord;
 mod editor;
 mod export;
 mod formats;
+mod history;
 mod job;
 #[cfg(test)]
 mod job_it;
@@ -44,10 +47,12 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             let log = log::Log::new();
+            let use_path_deps = settings::Settings::load().use_path_deps;
             log.info("cheapedit started");
             log.info(format!("Version {}{}", update::CURRENT, if winutil::is_dev() { " (dev build)" } else { "" }));
             let mut app = App {
-                report: deps::check_all(),
+                report: deps::check_all(use_path_deps),
+                use_path_deps,
                 screen: Screen::Setup,
                 editor: None,
                 updater: update::Updater::new(log.clone()),
@@ -57,6 +62,9 @@ fn main() -> eframe::Result {
                 open_arg,
                 title: String::new(),
             };
+            for line in app.report.summary() {
+                app.log.info(line);
+            }
             // Skip the setup screen when everything is already in place.
             if app.report.all_ok() {
                 app.enter_editor(&cc.egui_ctx);
@@ -92,6 +100,8 @@ struct App {
     log: log::Log,
     open_arg: Option<PathBuf>,
     title: String,
+    /// "Use my own FFmpeg and libmpv from PATH" (also kept in settings).
+    use_path_deps: bool,
 }
 
 impl App {
@@ -239,6 +249,24 @@ impl App {
                     }
                 }
             }
+            let bundled = deps::bundled_versions();
+            if !bundled.is_empty() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Includes").strong());
+                for line in &bundled {
+                    ui.label(line);
+                }
+                theme::hint(
+                    ui,
+                    "Both are free software under the GNU GPL, as is cheapedit itself (GPL-3.0-or-later). \
+                     The exact source code for these builds is attached to every release on GitHub.",
+                );
+                if let Some(dir) = deps::bundled_dir() {
+                    if ui.button("Open licences folder").clicked() {
+                        winutil::open_folder(&dir.join("licenses"));
+                    }
+                }
+            }
             ui.add_space(6.0);
             ui.hyperlink_to("All releases on GitHub", update::releases_page());
         });
@@ -255,18 +283,32 @@ impl eframe::App for App {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         let has_editor = self.editor.is_some();
-                        match setup_ui::show(ui, &self.report, has_editor) {
-                            setup_ui::SetupAction::CheckAgain => {
-                                // Keep the libmpv that the running editor already uses.
-                                let api = self.report.mpv_api.clone();
-                                self.report = deps::check_all();
-                                if has_editor && self.report.mpv_api.is_none() {
-                                    self.report.mpv_api = api;
+                        let mut recheck = false;
+                        match setup_ui::show(ui, &self.report, has_editor, self.use_path_deps, has_editor) {
+                            setup_ui::SetupAction::UsePathDeps(on) => {
+                                self.use_path_deps = on;
+                                match &mut self.editor {
+                                    Some(ed) => ed.settings_mut().use_path_deps = on,
+                                    None => {
+                                        let mut s = settings::Settings::load();
+                                        s.use_path_deps = on;
+                                        s.save();
+                                    }
                                 }
-                                self.log.info("Re-checked FFmpeg, ffprobe and libmpv.");
+                                recheck = true;
                             }
+                            setup_ui::SetupAction::CheckAgain => recheck = true,
                             setup_ui::SetupAction::Continue => self.enter_editor(&ctx),
                             setup_ui::SetupAction::None => {}
+                        }
+                        if recheck {
+                            // Keep the libmpv that the running editor already uses.
+                            let api = self.report.mpv_api.clone();
+                            self.report = deps::check_all(self.use_path_deps);
+                            if has_editor && self.report.mpv_api.is_none() {
+                                self.report.mpv_api = api;
+                            }
+                            self.log.info("Re-checked FFmpeg, ffprobe and libmpv.");
                         }
                     });
                 });

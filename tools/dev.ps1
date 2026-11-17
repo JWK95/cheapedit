@@ -11,4 +11,9 @@
 param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $AppArgs)
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
+# The bundled FFmpeg and libmpv live in target\deps (made once by fetch-deps.ps1).
+if (-not (Test-Path 'target\deps\ffmpeg.exe')) {
+    & "$PSScriptRoot\fetch-deps.ps1"
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+}
 cargo run -- @AppArgs

@@ -1,5 +1,6 @@
-//! The setup screen: checks for FFmpeg, ffprobe and libmpv and teaches how to
-//! install anything missing the right way. It never installs or changes anything itself.
+//! The setup screen: shows which FFmpeg, ffprobe and libmpv cheapedit uses
+//! (its own bundled copies, or the user's from PATH), and teaches how to
+//! install your own the right way. It never installs or changes anything itself.
 
 use crate::deps::{Report, Status};
 use crate::theme;
@@ -14,20 +15,44 @@ pub enum SetupAction {
     None,
     CheckAgain,
     Continue,
+    /// The "Use my own FFmpeg and libmpv from PATH" switch changed.
+    UsePathDeps(bool),
 }
 
 /// Draw the setup screen. `can_close` is true when opened from the editor.
-pub fn show(ui: &mut egui::Ui, report: &Report, can_close: bool) -> SetupAction {
+/// `use_path`: the "use my own copies" switch. `restart_note`: the editor is
+/// already running, so a switch change applies next time cheapedit starts.
+pub fn show(ui: &mut egui::Ui, report: &Report, can_close: bool, use_path: bool, restart_note: bool) -> SetupAction {
     let mut action = SetupAction::None;
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.set_max_width(820.0);
         ui.add_space(12.0);
-        ui.heading(RichText::new("Let's get cheapedit ready").size(24.0));
+        ui.heading(RichText::new("FFmpeg and libmpv").size(24.0));
         ui.add_space(4.0);
         ui.label(
             "cheapedit is a front end: FFmpeg does the editing and libmpv plays the video. \
-             You install them once, system-wide, so every tool on your PC can use the same up-to-date copy.",
+             cheapedit comes with its own copies of both, so normally there's nothing to set up.",
         );
+        ui.add_space(6.0);
+        let mut own = use_path;
+        if ui
+            .checkbox(&mut own, "Use my own FFmpeg and libmpv from PATH")
+            .on_hover_text("For people who install and update FFmpeg and libmpv themselves. If yours are missing or broken, the bundled copies are used instead.")
+            .changed()
+        {
+            action = SetupAction::UsePathDeps(own);
+        }
+        theme::hint(
+            ui,
+            if use_path {
+                "Your own copies are used first. The guides below show how to install them."
+            } else {
+                "The bundled copies are used first. Your own copies on PATH are only used if a bundled one is missing or broken."
+            },
+        );
+        if restart_note {
+            theme::warn(ui, "Changing this takes effect the next time cheapedit starts.");
+        }
         ui.add_space(12.0);
 
         status_row(ui, "FFmpeg", "Does all the cutting, converting and encoding.", &report.ffmpeg);
@@ -45,7 +70,7 @@ pub fn show(ui: &mut egui::Ui, report: &Report, can_close: bool) -> SetupAction 
                     action = SetupAction::Continue;
                 }
             } else {
-                ui.label(RichText::new("All three are needed before cheapedit can open.").color(theme::MUTED));
+                ui.label(RichText::new("All three are needed before cheapedit can open. If the bundled copies are missing, reinstalling cheapedit puts them back.").color(theme::MUTED));
             }
         });
         ui.label(
@@ -56,6 +81,7 @@ pub fn show(ui: &mut egui::Ui, report: &Report, can_close: bool) -> SetupAction 
 
         ui.add_space(16.0);
         let ff_missing = !report.ffmpeg.is_ok() || !report.ffprobe.is_ok();
+        ui.label(RichText::new("Installing your own copies (optional)").strong().size(15.0));
         egui::CollapsingHeader::new(RichText::new("How to install FFmpeg (and ffprobe)").size(17.0))
             .default_open(ff_missing)
             .show(ui, ffmpeg_guide);
@@ -87,15 +113,15 @@ fn status_row(ui: &mut egui::Ui, name: &str, what: &str, status: &Status) {
                 ui.label(RichText::new(name).strong().size(15.0));
                 ui.label(RichText::new(what).color(theme::MUTED));
                 match status {
-                    Status::Ok { path, version, note } => {
-                        ui.label(format!("Found {version}"));
+                    Status::Ok { path, version, note, origin } => {
+                        ui.label(format!("{}: {version}", origin.label()));
                         ui.label(RichText::new(path.display().to_string()).monospace().small().color(theme::MUTED));
                         if let Some(n) = note {
                             ui.label(RichText::new(n).small().color(theme::MUTED));
                         }
                     }
                     Status::Missing => {
-                        ui.label(RichText::new("Not found on your PATH.").color(theme::DANGER));
+                        ui.label(RichText::new("Not found: not bundled, and not on your PATH.").color(theme::DANGER));
                     }
                     Status::Problem { path, reason } => {
                         ui.label(RichText::new(reason).color(theme::WARN));
@@ -198,7 +224,7 @@ fn libmpv_guide(ui: &mut egui::Ui) {
     );
     command_block(ui, ADD_TO_USER_PATH);
     ui.label(
-        RichText::new("Prefer clicking? Start → search 'Edit environment variables for your account' → Path → Edit → New → paste the folder path → OK.")
+        RichText::new("Prefer clicking? Start > search 'Edit environment variables for your account' > Path > Edit > New > paste the folder path > OK.")
             .color(theme::MUTED),
     );
     step(
@@ -213,8 +239,9 @@ fn libmpv_guide(ui: &mut egui::Ui) {
 fn path_explainer(ui: &mut egui::Ui) {
     ui.label(
         "PATH is a list of folders Windows searches when a program asks for a tool by name, like 'ffmpeg'. \
-         Putting FFmpeg and libmpv on PATH means one copy serves every app and terminal on your PC, and updating \
-         that one copy updates them all — instead of each app hiding its own old copy.",
+         If you install your own FFmpeg and libmpv, putting them on PATH means one copy serves every app and \
+         terminal on your PC, and updating that one copy updates them all. cheapedit's bundled copies live in \
+         its own folder and are never added to PATH, so they can't clash with yours.",
     );
     ui.add_space(4.0);
     ui.label(

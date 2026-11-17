@@ -20,6 +20,16 @@ pub struct Settings {
     pub preview_volume: u32,
     /// Show the ghost line where playback last started.
     pub show_ghost: bool,
+    /// The folder the Clips drawer lists.
+    pub clips_dir: Option<PathBuf>,
+    /// The Clips drawer is open.
+    pub clips_open: bool,
+    /// The Clips drawer's width in points.
+    pub clips_width: f32,
+    /// Where the drawer's divider sits: the Editing half's share of the height.
+    pub clips_split: f32,
+    /// Use the user's own FFmpeg and libmpv from PATH before the bundled ones.
+    pub use_path_deps: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +43,11 @@ impl Default for Settings {
             zoom_static_preview: false,
             preview_volume: 100,
             show_ghost: true,
+            clips_dir: None,
+            clips_open: true,
+            clips_width: 250.0,
+            clips_split: 0.5,
+            use_path_deps: false,
         }
     }
 }

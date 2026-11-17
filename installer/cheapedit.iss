@@ -5,6 +5,9 @@
 ;
 ; The in-app updater runs this installer with /SILENT /RELAUNCH=1: it updates
 ; in place (same folder, same install mode) and reopens cheapedit afterwards.
+;
+; It bundles FFmpeg and libmpv from target\deps (made by tools\fetch-deps.ps1)
+; into {app}\deps. Nothing is added to PATH or installed system-wide.
 
 #define AppName "cheapedit"
 #ifndef AppVersion
@@ -28,6 +31,7 @@ DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 SetupIconFile=..\assets\cheapedit.ico
+LicenseFile=..\LICENSE
 WizardStyle=modern
 OutputDir=Output
 OutputBaseFilename=cheapedit-Setup-{#AppVersion}
@@ -42,8 +46,14 @@ CloseApplications=yes
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 Name: "contextmenu"; Description: "Add ""Edit with cheapedit"" to the right-click menu for video files"
 
+[InstallDelete]
+; Start deps\ fresh on every install/update, so an older FFmpeg's DLLs don't linger.
+Type: filesandordirs; Name: "{app}\deps"
+
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\deps\*"; DestDir: "{app}\deps"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\SETUP.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -103,7 +113,7 @@ Filename: "{app}\{#AppExe}"; Description: "Launch cheapedit"; Flags: nowait post
 Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: IsRelaunch
 
 [Messages]
-FinishedLabel=cheapedit is installed.%n%ncheapedit uses FFmpeg and libmpv, which you install once for your whole PC. If they aren't set up yet, cheapedit will walk you through it the first time it opens.
+FinishedLabel=cheapedit is installed.%n%nIt comes with its own FFmpeg and libmpv, so there's nothing else to set up.
 
 [Code]
 // True when started by cheapedit's updater (/RELAUNCH=1).

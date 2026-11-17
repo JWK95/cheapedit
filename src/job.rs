@@ -2,6 +2,7 @@
 //!
 //! This is pure (no I/O), so every combination can be unit-tested.
 
+use crate::discord::{Plan, Preset};
 use crate::formats::{ACodec, Container, VCodec};
 use crate::probe::MediaInfo;
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,9 @@ pub struct Options {
     pub audio_kbps: u32,
     pub mp3_kbps: u32,
     pub use_gpu: bool,
+    /// Custom, or a Discord size-cap preset that overrides the format,
+    /// codec, quality, frame rate and resolution while it's chosen.
+    pub preset: Preset,
 }
 
 impl Default for Options {
@@ -198,6 +202,7 @@ impl Default for Options {
             audio_kbps: 192,
             mp3_kbps: 192,
             use_gpu: true,
+            preset: Preset::Custom,
         }
     }
 }
@@ -208,6 +213,33 @@ impl Options {
     }
     pub fn effective_speed(&self) -> f64 {
         if self.mode == CutMode::Fast { 1.0 } else { self.speed }
+    }
+
+    /// These options with a Discord preset's fixed choices applied: Precise,
+    /// MP4, H.264, AAC, and the plan's bitrate, resolution and frame rate.
+    /// Your own Custom choices are left untouched in the saved settings.
+    pub fn with_preset_basics(&self) -> Options {
+        let mut o = self.clone();
+        if o.preset.cap_mb().is_some() {
+            o.mode = CutMode::Precise;
+            o.container = Container::Mp4;
+            o.vcodec = VCodec::H264;
+            o.acodec = ACodec::Aac;
+            o.quality = Quality::Custom;
+            if o.av == AvMode::AudioOnly {
+                o.av = AvMode::Both;
+            }
+        }
+        o
+    }
+
+    pub fn with_plan(&self, p: &Plan) -> Options {
+        let mut o = self.with_preset_basics();
+        o.custom_kbps = p.video_kbps;
+        o.audio_kbps = p.audio_kbps.unwrap_or(o.audio_kbps);
+        o.resolution = if p.same_height { Resolution::Same } else { Resolution::ALL.into_iter().find(|r| r.height() == Some(p.height)).unwrap_or(Resolution::Same) };
+        o.fps = if p.same_fps { FrameRate::Same } else { FrameRate::Fps(p.fps.round() as u32) };
+        o
     }
 }
 
@@ -381,7 +413,9 @@ fn video_quality_args(enc: &str, o: &Options) -> Vec<String> {
     let s = o.enc_speed.index();
     let k = o.custom_kbps;
     let custom = o.quality == Quality::Custom;
-    let bitrate = || vec!["-b:v".to_string(), format!("{k}k"), "-maxrate".into(), format!("{}k", k * 3 / 2), "-bufsize".into(), format!("{}k", k * 2)];
+    // A size cap needs the peak held at the target, or busy scenes overshoot.
+    let peak = if o.preset.cap_mb().is_some() { k } else { k * 3 / 2 };
+    let bitrate = || vec!["-b:v".to_string(), format!("{k}k"), "-maxrate".into(), format!("{peak}k"), "-bufsize".into(), format!("{}k", k * 2)];
     let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<String>>();
 
     let mut out: Vec<String>;
@@ -443,21 +477,85 @@ pub fn estimate_bytes(j: &Job) -> u64 {
     (bps * dur / 8.0) as u64
 }
 
-/// `holiday_clip_25-45_1.5x`, without extension.
-pub fn auto_name(input: &Path, start: f64, end: f64, speed: f64, zoom: bool) -> String {
-    let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into());
-    let mut name = format!(
-        "{stem}_{}-{}",
-        crate::timecode::format_for_filename(start),
-        crate::timecode::format_for_filename(end)
-    );
-    if speed != 1.0 {
-        name.push_str(&format!("_{}x", n(speed)));
+/// What an export will come out as, for the Estimate card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Estimate {
+    pub bytes: u64,
+    /// Output picture size; None for audio only.
+    pub size: Option<(u32, u32)>,
+    pub fps: Option<f64>,
+    /// Video bitrate; a guess unless the quality is a fixed bitrate.
+    pub video_kbps: Option<u32>,
+    /// Audio bitrate; None when there's no audio or it's lossless.
+    pub audio_kbps: Option<u32>,
+    /// Fast mode: the video is copied as it is.
+    pub video_copied: bool,
+    /// The video bitrate is set exactly (Custom bitrate or a Discord preset).
+    pub exact_bitrate: bool,
+}
+
+pub fn estimate(j: &Job) -> Estimate {
+    let o = j.opts;
+    let m = j.media;
+    let fast = o.mode == CutMode::Fast;
+    let audio_only = o.av == AvMode::AudioOnly || m.video.is_none();
+    let dur = output_duration(j.start, j.end, o.effective_speed()).max(0.001);
+    let bytes = estimate_bytes(j);
+    let has_a = m.audio.is_some() && o.av != AvMode::RemoveAudio;
+    let audio_kbps = if !has_a || o.av == AvMode::Mute && !audio_only {
+        // Muted audio is a silent track: next to nothing.
+        None
+    } else if audio_only {
+        Some(o.mp3_kbps)
+    } else if fast || !o.acodec.has_bitrate() {
+        None
+    } else {
+        Some(o.audio_kbps)
+    };
+    let (size, fps, video_kbps) = match m.video.as_ref().filter(|_| !audio_only) {
+        None => (None, None, None),
+        Some(v) if fast => (Some((v.width, v.height)), Some(v.fps), m.bitrate.map(|b| (b / 1000) as u32)),
+        Some(v) => {
+            let size = match o.resolution.height() {
+                Some(h) => (crate::discord::scaled_width(v.width, v.height, h), h),
+                None => (v.width, v.height),
+            };
+            let fps = match o.fps {
+                FrameRate::Fps(f) => f as f64,
+                FrameRate::Same => v.fps,
+            };
+            let kbps = if o.quality == Quality::Custom {
+                o.custom_kbps
+            } else {
+                ((bytes as f64 * 8.0 / dur / 1000.0) as u32).saturating_sub(audio_kbps.unwrap_or(0))
+            };
+            (Some(size), Some(fps), Some(kbps))
+        }
+    };
+    Estimate { bytes, size, fps, video_kbps, audio_kbps, video_copied: fast && !audio_only, exact_bitrate: !fast && o.quality == Quality::Custom }
+}
+
+/// A local date and time, to the minute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+}
+
+impl Stamp {
+    /// `17-11-26 21-04` (dd-mm-yy hh-mm). Windows doesn't allow `:` in names.
+    pub fn text(&self) -> String {
+        format!("{:02}-{:02}-{:02} {:02}-{:02}", self.day, self.month, self.year % 100, self.hour, self.minute)
     }
-    if zoom {
-        name.push_str("_zoom");
-    }
-    name
+}
+
+/// `Call of Duty Black Ops 6 17-11-26 21-04`, without extension: the game
+/// (or the source's own name when the game isn't known) and when it was exported.
+pub fn auto_name(game: &str, at: Stamp) -> String {
+    format!("{game} {}", at.text())
 }
 
 /// Make a user-typed name safe for Windows. Returns None if nothing usable is left.
@@ -581,6 +679,35 @@ mod tests {
     }
 
     #[test]
+    fn discord_preset_args() {
+        let base = Options { preset: Preset::Discord10, container: Container::Mkv, vcodec: VCodec::H265, mode: CutMode::Fast, av: AvMode::AudioOnly, ..Default::default() };
+        let plan = crate::discord::plan(10_000_000, 20.0, 1920, 1080, 60.0, true).unwrap();
+        let o = base.with_plan(&plan);
+        assert_eq!((o.container, o.vcodec, o.mode, o.av), (Container::Mp4, VCodec::H264, CutMode::Precise, AvMode::Both));
+        let a = args(&o, Some("libx264"));
+        let k = plan.video_kbps;
+        assert!(a.contains(&format!("-b:v {k}k -maxrate {k}k")), "peak held at the target: {a}");
+        assert!(a.contains("fps=30,format=yuv420p") && !a.contains("scale="), "1080p30 from a 1080p60 source: {a}");
+        assert!(a.contains("-c:a aac -b:a 128k"));
+        // Custom keeps the usual 1.5x peak.
+        let o = Options { quality: Quality::Custom, custom_kbps: 1000, ..Default::default() };
+        assert!(args(&o, Some("libx264")).contains("-maxrate 1500k"));
+    }
+
+    #[test]
+    fn estimates() {
+        let m = media();
+        let out = PathBuf::from("x.mp4");
+        let o = Options { resolution: Resolution::P720, fps: FrameRate::Fps(30), ..Default::default() };
+        let j = Job { media: &m, opts: &o, start: 0.0, end: 10.0, output: &out, video_encoder: None, can_tonemap: true, zones: &[] };
+        let e = estimate(&j);
+        assert_eq!((e.size, e.fps, e.audio_kbps, e.exact_bitrate), (Some((1280, 720)), Some(30.0), Some(192), false));
+        let o = Options { mode: CutMode::Fast, ..Default::default() };
+        let e = estimate(&Job { opts: &o, ..j });
+        assert!(e.video_copied && e.size == Some((1920, 1080)));
+    }
+
+    #[test]
     fn atempo_chains() {
         assert_eq!(atempo_chain(2.0), vec!["atempo=2"]);
         assert_eq!(atempo_chain(0.3), vec!["atempo=0.5", "atempo=0.6"]);
@@ -588,8 +715,8 @@ mod tests {
 
     #[test]
     fn names() {
-        assert_eq!(auto_name(Path::new("C:\\v\\holiday_clip.mp4"), 25.0, 45.0, 1.5, false), "holiday_clip_25-45_1.5x");
-        assert_eq!(auto_name(Path::new("clip.mp4"), 25.0, 45.0, 1.0, true), "clip_25-45_zoom");
+        let at = Stamp { year: 2026, month: 11, day: 7, hour: 9, minute: 4 };
+        assert_eq!(auto_name("Call of Duty Black Ops 6", at), "Call of Duty Black Ops 6 07-11-26 09-04");
         assert_eq!(sanitize_name("  my: clip?. "), Some("my_ clip_".into()));
         assert_eq!(sanitize_name("con"), Some("con_".into()));
         assert_eq!(sanitize_name("   "), None);

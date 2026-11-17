@@ -2,17 +2,20 @@
 name = "cheapedit"
 version = "0.3.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1.0.104"
+drag = "2.1.1"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "accesskit", "links", "clipboard"] }
 libloading = "0.9.0"
+raw-window-handle = "0.6"
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 toml = "1.2.1"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_OpenGL", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_OpenGL", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Time"] }
 winreg = "0.56.0"
 
 [dev-dependencies]

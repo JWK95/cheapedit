@@ -4,11 +4,14 @@
 #
 # Steps (stops at the first problem; nothing is published until all checks pass):
 #   1. Checks: on branch main, no uncommitted changes, version is new.
-#   2. Sets the version in Cargo.toml, runs the tests, builds the release exe.
-#   3. Builds the installer and its SHA-256 checksum file.
+#   2. Fetches the pinned FFmpeg and libmpv (tools\deps.toml), checking every
+#      SHA-256, sets the version in Cargo.toml, runs the tests, builds the exe.
+#   3. Builds the installer (with FFmpeg and libmpv in deps\) and its SHA-256
+#      checksum file.
 #   4. Commits "Release vX.Y.Z", tags it, pushes, and creates the GitHub release
-#      with the installer + checksum attached. Installed copies of cheapedit
-#      then offer the update the next time they start.
+#      with the installer + checksum attached, plus the exact FFmpeg and mpv
+#      source archives (the GPL's source requirement). Installed copies of
+#      cheapedit then offer the update the next time they start.
 param(
     [Parameter(Mandatory = $true)] [string] $Version,
     [Parameter(Mandatory = $true)] [string] $Notes
@@ -41,6 +44,14 @@ $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", "${env:ProgramFile
 if (-not $iscc) { Fail "Inno Setup 6 not found. Install it with: winget install JRSoftware.InnoSetup" }
 Run gh @('auth', 'status')
 
+Step "Fetching FFmpeg and libmpv"
+& "$PSScriptRoot\fetch-deps.ps1"
+if ($LASTEXITCODE -ne 0) { Fail "fetch-deps.ps1 failed." }
+$sources = @(Select-String -Path tools\deps.toml -Pattern '^source_name = "(.+)"' | ForEach-Object { "target\deps-cache\$($_.Matches[0].Groups[1].Value)" })
+foreach ($s in $sources) { if (-not (Test-Path $s)) { Fail "Source archive missing: $s" } }
+$included = (Get-Content target\deps\VERSIONS.txt | Where-Object { $_ }) -join "`n- "
+$Notes = "$Notes`n`nIncludes:`n- $included`n`nThe exact source code for these is attached below, as the GPL requires."
+
 Step "Setting version $Version"
 $toml = Get-Content Cargo.toml -Raw
 $toml = [regex]::Replace($toml, '(?m)^version = ".*?"', "version = `"$Version`"", 1)
@@ -72,7 +83,7 @@ Run git @('push', 'origin', $tag)
 Step "Creating the GitHub release"
 $notesFile = New-TemporaryFile
 [IO.File]::WriteAllText($notesFile.FullName, $Notes)
-Run gh @('release', 'create', $tag, $setup, $shaFile, '--title', "cheapedit $Version", '--notes-file', $notesFile.FullName)
+Run gh (@('release', 'create', $tag, $setup, $shaFile) + $sources + @('--title', "cheapedit $Version", '--notes-file', $notesFile.FullName))
 Remove-Item $notesFile
 
 Write-Host "`nDone: cheapedit $Version is released." -ForegroundColor Green
