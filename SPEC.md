@@ -140,41 +140,54 @@ Zoom into part of the picture for a stretch of time. Done entirely with FFmpeg (
 - **Greyed out** in Fast cut mode and for "Audio only", with the reason, like speed.
 - **Each zone is a card**, top to bottom:
   - the zone number, its zoom (e.g. `2.0x`) and a delete button
-  - **Start box** and **End box** columns, each with **Draw box** (until drawn), **Select box** (shows it on the video to move or resize it) and **Redraw**. Each button jumps the playhead to the zone's start or end frame.
+  - two tabs, **Simple** and **Precise** (added in v0.6.1, see below). New zones open on Simple.
   - start and end times (typed like trim, with `h:mm:ss.ms` below and a "Use playhead" button)
-  - under the times, side by side: **Smooth** under Start (on by default, glide 0.5 s) and **No box change** under End. No box change is on by default. It locks the end box to the start box, so there's no pan, and greys out the end box's buttons. Turning it off starts drawing the end box.
+  - **Smooth** under the times (on by default, glide 0.5 s), on both tabs.
   - Clicking the zone number selects the zone and jumps to its start.
+- **Simple tab:** one box with **Draw box** (until drawn), **Select box** (shows it on the video to move or resize it) and **Redraw**, each jumping to the zone start. The zoom stays on that box for the whole zone: no movement, no tracking.
+- **Precise tab** (v0.6.1): the camera moves. A choice of **"Move by: My points / Follow automatically"** (Follow automatically is section 5b).
+  - **My points:** a list of up to **20 points**, each a box (any size) at a time. **Point 1** is always at the zone start (it's the same box as Simple's). Other points have their own time (typed, with "= in final video" and **Use playhead**) plus **Select**, **Redraw** and **Remove**; Select jumps to the point. The list is kept in time order.
+  - **"+ Add point at playhead"** (shortcut `P`, rebindable) pauses and adds a point whose box starts as a copy of where the camera is at that moment, ready to move or resize. Greyed out outside the zone, on an existing point, or at 20 points. `P` also works on a Simple zone (it switches to Precise) and, with no zone selected, on the zone under the playhead.
+  - **"+ Insert between N and N+1"** above each point (from point 2 on) adds a point halfway between the two, the same way.
+  - **Timeline:** each point is a small diamond on the zone's band (white = the selected point, hollow = not used). Click one to jump to it and edit it; drag one (not point 1) to change its time, kept inside the zone; the list re-sorts when you let go. Double-click the band to add a point there.
+  - `Delete` removes the selected point (when one after point 1 is selected), otherwise the zone.
+  - **Motion:** a flowing curve through every point (Catmull-Rom style, timed by the points), with no stop at each point; it eases only at the first and last point. After the last point the camera holds until the zone ends. With two points this is exactly the old eased pan.
+  - **Points that aren't used** stay on the card, greyed with the reason, and come back when fixed: outside the zone (e.g. after dragging an edge), inside the glide in or out, or at the same time as another point.
+  - On the video, the selected point's box is editable when the playhead is on that point; elsewhere in the zone the camera's box at the playhead is shown ("Zone N - camera"), not editable.
+- **Switching tabs never loses work:** Simple uses point 1's box; Precise's points and tracking are kept while Simple is showing. Export uses the tab that's showing.
 - **Times refer to the original video**, like trim. Speed is applied after the zoom.
 - **Drawing:** "+ New zone" pauses and you draw the box on the Original view. Boxes are locked to the video's aspect ratio. Drag the middle to move, the corners to resize. The selected box is highlighted; other zones show faintly while the playhead is inside their time.
-- **Pan:** with No box change off, the zone pans from its Start box to its End box (they may differ in size). The move is eased (slow-fast-slow).
-- **Smooth:** the glide happens **inside** the zone: full frame at the zone start, fully zoomed one glide later, zooming out one glide before the end, full frame at the end. With Pan on, the pan runs between the two glides. With Smooth off the zoom cuts in and out, and the pan spans the whole zone.
+- **Smooth:** the glide happens **inside** the zone: full frame at the zone start, fully zoomed one glide later, zooming out one glide before the end, full frame at the end. Precise points move between the two glides. With Smooth off the zoom cuts in and out, and points can use the whole zone.
+- **Older montages** (v0.6): a zone with No box change loads as Simple; a pan (start box to end box) loads as Precise with 2 points, the second one glide before the end, so it moves exactly as before; a tracked zone loads as Precise, Follow automatically, with its path and fixes.
 - **Touching zones:** when the gap between two smooth zones is no longer than the glide, the view glides straight from the first zone's (end) box to the next zone's (start) box instead of zooming fully out.
 - **Timeline:** each zone is a numbered, coloured band under the timeline, matching its box and card. Clicking a band selects it; dragging its edges changes its times. Ctrl/Shift+Click still only set the trim.
 - **Limits:** a warning above 3× enlargement; a box can't be smaller than 1/10 of the frame.
 - **Checks that block Export:**
-  - a zone's box hasn't been drawn yet; a panning zone's end box hasn't been drawn (offers "No box change")
+  - a zone's box hasn't been drawn yet
+  - a Precise point's time can't be read
   - zones overlap (offers a fix)
   - a zone isn't inside the trim, e.g. after the trim was changed (offers "Shrink zone to fit" and "Delete zone")
   - a smooth zone is shorter than two glides; a zone with Smooth off is shorter than 0.1 s
 - **Output:** the zoom never changes the output resolution. HDR is converted to SDR before the crop. (The automatic name has no zoom tag.)
 - **Export filter:** `fps=<source fps>` (constant frame rate, so frames map 1:1) then `zoompan` with `d=1`, its `z`/`x`/`y` built as piecewise `if(lt(it,…))` expressions with smoothstep easing. (Tested: `crop` can't do this, because it fixes its size at start-up.)
 - **Preview:** Result's live preview drives mpv's `video-zoom` / `video-pan-x/y` from the same segments the FFmpeg expressions are built from (unit-tested to agree). zoompan can't run inside mpv, because it renumbers timestamps, which breaks seeking. The letterbox bars are kept black. A note says to use static preview if playback stutters (the export is not affected). A **"Static zoom preview"** checkbox shows box outlines instead of the live zoom.
-- **Shortcuts:** `Z` new zone, `Delete` delete the selected zone (both rebindable).
+- **Shortcuts:** `Z` new zone, `P` add a point, `Delete` delete the selected point or zone (all rebindable).
 - Zones are **not saved** between sessions and are cleared when another video is opened.
 
 ## 5b. Tracked zoom zones (v0.6)
 
 A zoom zone can follow something on screen by itself.
 
-- **"Track: follow what's in the box"** checkbox on a zoom zone card (turns off panning). Draw the Start box around the thing to follow and click **Track**: it runs in the background with a progress bar and Cancel (one zone at a time), then the zoom follows it for the whole zone. **Track again** starts over from the start box.
+- **"Track: follow what's in the box"** checkbox on a zoom zone card; from v0.6.1 it's **Precise → "Follow automatically"**, and the zone's own points are kept but not used. Draw point 1's box around the thing to follow and click **Track**: it runs in the background with a progress bar and Cancel (one zone at a time), then the zoom follows it for the whole zone. **Track again** starts over from the start box.
 - **Tracker:** the **VitTrack** model from OpenCV's model zoo (Apache 2.0), run with **ONNX Runtime 1.24.4 (DirectML build)**, both bundled in `deps\` (`onnxruntime.dll`, `DirectML.dll`, `modelsittrack.onnx`, about 36 MB together) with their licences, pinned in `tools\deps.toml`. Changed from NanoTrack on 2026-11-17: NanoTrack's models state no licence, so they can't be shipped; VitTrack is the same kind of small, fast tracker. 1.24.4 is the last ONNX Runtime with a DirectML build.
   - Pre- and post-processing follow OpenCV's TrackerVit: a 128x128 template from twice the box, a 256x256 search area four times the box, BGR pixels with ImageNet mean/std, a 16x16 score map weighted by a Hann window; below a 0.2 score the target counts as lost for that frame and the box holds still.
   - Frames come from FFmpeg as raw pictures, at most 640 wide and 30 per second.
 - **CPU or GPU:** the CPU by default; **Features** can switch to the graphics card (DirectML). If the GPU fails, it uses the CPU by itself, logs why, and Features shows it ("Last run: GPU failed (…), so the CPU was used.").
 - **The box keeps its size** (the zoom level doesn't pump in and out); only its position follows. A **Smoothness** slider (Gaussian smoothing, up to 0.8 s) makes the camera glide. Smooth glide in and out of the zone still applies.
-- **Fixing mistakes:** pause where it went wrong and click **Fix at playhead**; a yellow box appears on the video, drag it onto the target and let go. That frame becomes a **fix** and tracking re-runs **forwards** from it, keeping everything before. Fixes are listed on the card with **Remove** (tracks again from the fix before it). Smoothing never blurs across a fix.
-- **On the video:** after the zone's first frame, Original shows the tracked box ("Zone N - tracked") where the zoom will be.
-- **Export:** the smoothed path is simplified to at most 40 keyframes per zone (straight lines between them, within 0.2% of the frame), built into the same zoompan expressions as other zones. **Preview** drives mpv's zoom/pan from the same path. If the tracked zones together would make the command line too long for Windows, Export is blocked with a hint to raise Smoothness or use fewer tracked zones. A zone set to Track that hasn't been tracked blocks Export too.
+- **Loop (optional, v0.6.1):** **Draw loop** jumps to the zone start; drag a freehand loop around just the thing to follow, inside the box (anything past the box's edge is cut off). The tracker only understands rectangles, so it follows the **rectangle around the loop**; the loop shows what you picked. The zoom keeps your framing: the box stays the same distance from the target as when you drew it. A loop that can't be used never fails silently: the reason shows on the video (under the instructions) and on the card ("Loop not used: …"), the old loop is kept, and it stays ready to draw again. The reasons: a click instead of a drag; mostly outside the box; a line rather than a loop; smaller than 3% of the frame either way. **Esc**, or **Stop drawing** on the card, stops drawing. Drawing or clearing a loop (**Redraw loop**, **Clear loop**) throws the old track away, so click Track again. With no loop, the whole box is followed, as before. Blanking out the pixels outside the loop was considered and left out: the model wasn't trained on that.
+- **Fixing mistakes:** pause where it went wrong and click **Fix at playhead**; a yellow box appears on the video (with the loop inside it, when there is one), drag it so the box, or the loop, sits on the target and let go. **Redraw loop** on the card while fixing draws a new loop inside the yellow box instead (for a target that changed shape); that loop is used from the fix on, keeping the framing where the box is. That frame becomes a **fix** and tracking re-runs **forwards** from it, keeping everything before. Fixes are listed on the card with **Remove** (tracks again from the fix before it). Smoothing never blurs across a fix.
+- **On the video:** after the zone's first frame, Original shows the tracked box ("Zone N - tracked") where the zoom will be, with the loop riding along on the target.
+- **Export:** the smoothed path is simplified to at most 40 keyframes per zone (straight lines between them, within 0.2% of the frame in position and size), built into the same zoompan expressions as other zones. Precise points' curves are sampled and simplified the same way. **Preview** drives mpv's zoom/pan from the same path. If the moving zones together would make the command line too long for Windows, Export is blocked with a hint to use fewer points, raise Smoothness or use fewer moving zones. A zone set to Track that hasn't been tracked blocks Export too.
 - Tracked paths are saved with a montage's clips.
 
 ## 5c. Overlays (v0.6)
@@ -358,7 +371,8 @@ Recorders like ShadowPlay can put game sound and the microphone on separate trac
 | `Ctrl+E` | Export |
 | `Ctrl+O` | Open file |
 | `Z` | New zoom zone |
-| `Delete` | Delete the selected zone or overlay |
+| `P` | Add zoom point at playhead (Precise) |
+| `Delete` | Delete the selected point, zone or overlay |
 | `S` | New speed zone |
 | `T` | New text overlay |
 | `G` | Open the KLIPY search |

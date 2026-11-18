@@ -3,7 +3,7 @@
 A lightweight Windows front end for FFmpeg. You can:
 
 - trim a clip between two timestamps
-- zoom into part of the picture for a stretch of time, with smooth glides and pans (up to 20 zones), or have the zoom **follow** something moving, like a player
+- zoom into part of the picture for a stretch of time (up to 20 zones): a **Simple** still zoom, a **Precise** zoom whose camera flows through points you set, or one that **follows** something moving, like a player (with an optional freehand loop around it)
 - slow motion and fast forward for any part of the clip, with the timeline stretching to show the new length
 - put pictures, GIFs, videos and text on top, and glide them across the frame
 - search KLIPY for a GIF with your own free key and drop it straight on the clip

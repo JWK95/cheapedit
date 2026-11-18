@@ -340,7 +340,8 @@ fn tracked_zone_exports() {
     let mut z = Zone::new(0.0, 4.0);
     z.a = a;
     z.a_drawn = true;
-    z.track = true;
+    z.mode = crate::zoom::Mode::Precise;
+    z.follow = true;
     z.track_points = run.points;
     let zones = [z.resolve().unwrap()];
     assert!(zones[0].path.as_ref().is_some_and(|p| p.len() >= 2));

@@ -139,7 +139,7 @@ pub fn check(i: &Input) -> Vec<Problem> {
             // Windows limits a command line to 32,767 characters.
             let resolved: Vec<zoom::Resolved> = i.zones.iter().filter_map(Zone::resolve).collect();
             if zoom::zoompan(&resolved, 0.0, 1920, 1080, 60.0).is_some_and(|f| f.len() > 24_000) {
-                out.push(p("The tracked zones move around too much to fit in one export. Raise their Smoothness, or use fewer tracked zones.", None));
+                out.push(p("The moving zoom zones move around too much to fit in one export. Use fewer points, raise Smoothness on tracked zones, or use fewer moving zones.", None));
             }
         }
     }

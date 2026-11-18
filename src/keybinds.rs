@@ -23,6 +23,8 @@ pub enum Action {
     /// Modifier + click on the timeline sets the end there.
     TimelineEnd,
     NewZone,
+    /// Add a Precise point to the selected zoom zone at the playhead.
+    AddZonePoint,
     DeleteZone,
     NewSpeedZone,
     NewTextOverlay,
@@ -31,7 +33,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 19] = [
+    pub const ALL: [Action; 20] = [
         Action::PlayPause,
         Action::FrameBack,
         Action::FrameForward,
@@ -46,6 +48,7 @@ impl Action {
         Action::TimelineStart,
         Action::TimelineEnd,
         Action::NewZone,
+        Action::AddZonePoint,
         Action::NewSpeedZone,
         Action::NewTextOverlay,
         Action::OpenKlipy,
@@ -72,7 +75,8 @@ impl Action {
             Action::TimelineStart => "Click timeline: set start",
             Action::TimelineEnd => "Click timeline: set end",
             Action::NewZone => "New zoom zone",
-            Action::DeleteZone => "Delete selected zone or overlay",
+            Action::AddZonePoint => "Add zoom point at playhead",
+            Action::DeleteZone => "Delete selected zone, point or overlay",
             Action::NewTextOverlay => "New text overlay",
             Action::OpenKlipy => "Search KLIPY for a GIF",
             Action::AddToMontage => "Add clip to montage",
@@ -96,6 +100,7 @@ impl Action {
             Action::TimelineStart => "start",
             Action::TimelineEnd => "end",
             Action::NewZone => "Zone",
+            Action::AddZonePoint => "Point",
             Action::DeleteZone => "Del zone",
             Action::NewSpeedZone => "Speed",
             Action::NewTextOverlay => "Text",
@@ -204,6 +209,7 @@ impl Default for Keybinds {
         map.insert(Action::TimelineStart, Binding::click(ctrl));
         map.insert(Action::TimelineEnd, Binding::click(shift));
         map.insert(Action::NewZone, Binding::plain(Key::Z));
+        map.insert(Action::AddZonePoint, Binding::plain(Key::P));
         map.insert(Action::DeleteZone, Binding::plain(Key::Delete));
         map.insert(Action::NewSpeedZone, Binding::plain(Key::S));
         map.insert(Action::NewTextOverlay, Binding::plain(Key::T));
@@ -310,6 +316,7 @@ mod tests {
         k.map.remove(&Action::TimelineStart);
         k.map.remove(&Action::TimelineEnd);
         k.map.remove(&Action::NewZone);
+        k.map.remove(&Action::AddZonePoint);
         k.fill_missing();
         assert_eq!(k, Keybinds::default());
     }

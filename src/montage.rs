@@ -66,7 +66,9 @@ impl Montage {
     }
     pub fn load(path: &Path) -> Result<Montage, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("Couldn't open {}: {e}", path.display()))?;
-        serde_json::from_str(&text).map_err(|e| format!("{} isn't a montage cheapedit can read ({e}).", path.display()))
+        let mut m: Montage = serde_json::from_str(&text).map_err(|e| format!("{} isn't a montage cheapedit can read ({e}).", path.display()))?;
+        m.clips.iter_mut().flat_map(|c| c.zones.iter_mut()).for_each(crate::zoom::Zone::upgrade);
+        Ok(m)
     }
     /// Save via a temporary file, so a crash mid-save never loses the project.
     pub fn save(&self, path: &Path) -> Result<(), String> {

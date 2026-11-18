@@ -199,13 +199,15 @@ pub struct Editor {
     pending_open: Option<PathBuf>,
     zones: Vec<Zone>,
     sel_zone: Option<usize>,
-    /// Editing the selected zone's end box (Pan) rather than its start box.
-    edit_end_box: bool,
+    /// Which point of the selected zone is being edited (0 = its first box).
+    edit_point: usize,
     /// The next drag on the video draws a fresh box.
     drawing: bool,
     box_drag: Option<BoxDrag>,
     /// Dragging a zone band's edge on the timeline: (zone, is start).
     band_drag: Option<(usize, bool)>,
+    /// Dragging a Precise point's marker on a zone band: (zone, point).
+    point_drag: Option<(usize, usize)>,
     /// Where a timeline drag is pointing. While set, the playhead shows this
     /// instead of mpv's position, so it sticks to the cursor even when mpv's
     /// seeks lag behind. After release it holds (with the release time) until
@@ -299,6 +301,12 @@ pub struct Editor {
     fix_box: Option<ZBox>,
     /// Where the fix box was grabbed (offset from its corner).
     fix_grab: Option<(f64, f64)>,
+    /// The next drag on the video draws a loop (in the selected zone's box, or the fix box).
+    lasso_mode: bool,
+    /// The loop being drawn (frame fractions).
+    lasso_stroke: Vec<(f64, f64)>,
+    /// Why the last loop drawn couldn't be used (shown until the next try).
+    lasso_error: Option<String>,
 }
 
 impl Editor {
@@ -355,10 +363,11 @@ impl Editor {
             pending_open: None,
             zones: Vec::new(),
             sel_zone: None,
-            edit_end_box: false,
+            edit_point: 0,
             drawing: false,
             box_drag: None,
             band_drag: None,
+            point_drag: None,
             scrub: None,
             live_zoom: ZBox::FULL,
             awaiting_frame: None,
@@ -412,6 +421,9 @@ impl Editor {
             fix_zone: None,
             fix_box: None,
             fix_grab: None,
+            lasso_mode: false,
+            lasso_stroke: Vec::new(),
+            lasso_error: None,
         }
     }
 
@@ -874,6 +886,14 @@ impl Editor {
             Action::OpenFile => self.open_dialog(),
             Action::ShowShortcuts => self.show_keys = true,
             Action::NewZone => self.new_zone(),
+            Action::AddZonePoint if self.zoom_allowed() => {
+                // The selected zone, or else the one under the playhead.
+                let pos = self.position();
+                let i = self.sel_zone.filter(|&i| i < self.zones.len()).or_else(|| self.zones.iter().position(|z| z.times().is_some_and(|(s, e)| pos > s && pos < e)));
+                if let Some(i) = i {
+                    self.add_zone_point(i, pos);
+                }
+            }
             Action::NewSpeedZone => self.new_speed_zone(),
             Action::NewTextOverlay => self.new_text_overlay(),
             Action::OpenKlipy => self.open_klipy(),
@@ -883,6 +903,8 @@ impl Editor {
                     self.delete_selected_overlay();
                 } else if self.sel_speed.is_some() {
                     self.delete_selected_speed();
+                } else if let Some(i) = self.sel_zone.filter(|&i| self.edit_point > 0 && self.zones.get(i).is_some_and(|z| z.uses_points())) {
+                    self.remove_zone_point(i, self.edit_point);
                 } else {
                     self.delete_selected_zone();
                 }
@@ -962,8 +984,9 @@ impl Editor {
         }
         self.zones.push(Zone::new(s, e));
         self.sel_zone = Some(self.zones.len() - 1);
-        self.edit_end_box = false;
+        self.edit_point = 0;
         self.drawing = true;
+        self.lasso_mode = false;
         self.view = View::Original;
         self.pause();
         self.seek(s);
@@ -1022,6 +1045,7 @@ impl Editor {
             }
         }
         self.drawing = false;
+        self.lasso_mode = false;
         self.box_drag = None;
     }
 
@@ -1030,24 +1054,59 @@ impl Editor {
         self.sel_zone = Some(i);
         self.sel_speed = None;
         self.sel_overlay = None;
-        self.edit_end_box = false;
+        self.edit_point = 0;
         self.drawing = false;
+        self.lasso_mode = false;
         if let Some((s, _)) = self.zones.get(i).and_then(|z| z.times()) {
             self.seek(s);
         }
     }
 
-    /// Show zone `i`'s start or end box on the matching frame, ready to
-    /// draw a new one (`draw`) or to move/resize the one there.
-    fn goto_zone_box(&mut self, i: usize, end_box: bool, draw: bool) {
+    /// How long one frame of the source lasts.
+    fn frame_len(&self) -> f64 {
+        1.0 / self.media.as_ref().and_then(|m| m.video.as_ref()).map_or(30.0, |v| v.fps.max(1.0))
+    }
+
+    /// Show zone `i`'s point `k` (0 = its first box) on its frame, ready to
+    /// draw a new box (`draw`) or to move/resize the one there.
+    fn goto_zone_box(&mut self, i: usize, k: usize, draw: bool) {
         self.sel_zone = Some(i);
-        self.edit_end_box = end_box;
+        self.edit_point = k;
         self.drawing = draw;
+        self.lasso_mode = false;
         self.view = View::Original;
         self.pause();
-        if let Some((s, e)) = self.zones.get(i).and_then(|z| z.times()) {
-            let fps = self.media.as_ref().and_then(|m| m.video.as_ref()).map(|v| v.fps).unwrap_or(30.0).max(1.0);
-            self.seek(if end_box { (e - 1.0 / fps).max(s) } else { s });
+        if let Some(t) = self.zones.get(i).and_then(|z| point_frame(z, k, self.frame_len())) {
+            self.seek(t);
+        }
+    }
+
+    /// Add a Precise point to zone `i` at time `t`, starting as a copy of
+    /// where the camera is then, and jump there to adjust it. A Simple
+    /// zone switches to Precise first.
+    fn add_zone_point(&mut self, i: usize, t: f64) {
+        let Some(z) = self.zones.get_mut(i) else { return };
+        if add_point_blocked(z, t).is_some() {
+            return;
+        }
+        if !z.uses_points() {
+            z.mode = zoom::Mode::Precise;
+            z.follow = false;
+        }
+        let cam = z.resolve().map(|r| zoom::sample(&zoom::segments(&[r]), t)).filter(|b| *b != ZBox::FULL).unwrap_or(z.a);
+        let k = z.add_point(t, cam);
+        self.goto_zone_box(i, k, false);
+    }
+
+    /// Remove zone `i`'s point `k` (1 or later).
+    fn remove_zone_point(&mut self, i: usize, k: usize) {
+        let Some(z) = self.zones.get_mut(i) else { return };
+        if k == 0 || k > z.points.len() {
+            return;
+        }
+        z.points.remove(k - 1);
+        if self.sel_zone == Some(i) && self.edit_point >= k {
+            self.edit_point = if self.edit_point == k { 0 } else { self.edit_point - 1 };
         }
     }
 
@@ -1638,30 +1697,56 @@ impl Editor {
             self.fix_on_video(ui, resp, vr, i);
             return;
         }
+        if self.lasso_mode && z.follows() {
+            self.start_loop_on_video(ui, resp, vr, i);
+            return;
+        }
         // A tracked zone after its first frame: show where the tracked box is.
         let first_frame = 1.0 / self.media.as_ref().and_then(|m| m.video.as_ref()).map_or(30.0, |v| v.fps.max(1.0));
         if z.tracked() && !self.drawing && self.box_drag.is_none() && z.times().is_some_and(|(s, e)| pos > s + first_frame && pos < e) {
             if let Some(path) = z.resolve().and_then(|r| r.path) {
-                let r = to_screen(zoom::box_at(&path, pos));
+                let b = zoom::box_at(&path, pos);
+                let r = to_screen(b);
                 painter.rect_stroke(r, 0.0, Stroke::new(2.0, col), egui::StrokeKind::Inside);
                 painter.text(r.left_top() + egui::vec2(6.0, 5.0), egui::Align2::LEFT_TOP, format!("Zone {} - tracked", i + 1), font.clone(), col);
+                // The loop rides along where the target is.
+                let lasso = z.loop_at(pos);
+                if !lasso.is_empty() {
+                    track_ui::paint_loop(&painter, vr, lasso, b, col.gamma_multiply(0.8));
+                }
             }
             return;
         }
-        let end_box = z.pan && self.edit_end_box;
-        let cur = if end_box { z.b } else { z.a };
-        let cur_drawn = if end_box { z.b_drawn } else { z.a_drawn };
-        let other_drawn = if end_box { z.a_drawn } else { z.b_drawn };
+        // Precise points: the point being edited, when the playhead is on it.
+        let multi = z.uses_points() && !z.points.is_empty();
+        let k = if multi && self.edit_point <= z.points.len() { self.edit_point } else { 0 };
+        if multi && !self.drawing && self.box_drag.is_none() {
+            let on_point = point_frame(&z, k, first_frame).is_some_and(|t| (pos - t).abs() < first_frame * 0.75);
+            if !on_point {
+                // Elsewhere: where the camera is, not editable.
+                let cam = z.resolve().map(|r| zoom::sample(&zoom::segments(&[r]), pos)).filter(|b| *b != ZBox::FULL);
+                if let (Some(b), true) = (cam, z.times().is_some_and(|(s, e)| pos >= s && pos < e)) {
+                    let r = to_screen(b);
+                    painter.rect_stroke(r, 0.0, Stroke::new(1.5, col.gamma_multiply(0.8)), egui::StrokeKind::Inside);
+                    painter.text(r.left_top() + egui::vec2(6.0, 5.0), egui::Align2::LEFT_TOP, format!("Zone {} - camera", i + 1), font.clone(), col);
+                }
+                return;
+            }
+        }
+        let cur = if k == 0 { z.a } else { z.points[k - 1].b };
+        let cur_drawn = k > 0 || z.a_drawn;
         let r = to_screen(cur);
-        if z.pan && other_drawn {
-            // The other box of the pan, thin, with an arrow showing the move.
-            let other = to_screen(if end_box { z.a } else { z.b });
-            painter.rect_stroke(other, 0.0, Stroke::new(1.0, col.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-            let label = if end_box { "start" } else { "end" };
-            painter.text(other.left_top() + egui::vec2(5.0, 3.0), egui::Align2::LEFT_TOP, label, font.clone(), col.gamma_multiply(0.8));
-            let (from, to) = if end_box { (other.center(), r.center()) } else { (r.center(), other.center()) };
-            if cur_drawn && from.distance(to) > 12.0 {
-                painter.arrow(from, to - from, Stroke::new(1.5, col.gamma_multiply(0.7)));
+        if multi {
+            // The points either side, thin, with arrows showing the way the camera goes.
+            for j in [k.checked_sub(1), Some(k + 1)].into_iter().flatten().filter(|&j| j <= z.points.len()) {
+                let ob = if j == 0 { z.a } else { z.points[j - 1].b };
+                let other = to_screen(ob);
+                painter.rect_stroke(other, 0.0, Stroke::new(1.0, col.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                painter.text(other.left_top() + egui::vec2(5.0, 3.0), egui::Align2::LEFT_TOP, format!("point {}", j + 1), font.clone(), col.gamma_multiply(0.8));
+                let (from, to) = if j < k { (other.center(), r.center()) } else { (r.center(), other.center()) };
+                if from.distance(to) > 12.0 {
+                    painter.arrow(from, to - from, Stroke::new(1.5, col.gamma_multiply(0.7)));
+                }
             }
         }
         if cur_drawn || self.box_drag.is_some() {
@@ -1671,14 +1756,17 @@ impl Editor {
                 painter.rect_filled(egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0)), 1.0, col);
             }
             let mut label = format!("Zone {}", i + 1);
-            if z.pan {
-                label.push_str(if end_box { " - end box" } else { " - start box" });
+            if multi {
+                label.push_str(&format!(" - point {}", k + 1));
             }
             label.push_str(&format!("  {:.1}x", cur.zoom()));
             painter.text(r.left_top() + egui::vec2(6.0, 5.0), egui::Align2::LEFT_TOP, label, font.clone(), col);
+            if z.follows() && !z.lasso.is_empty() {
+                track_ui::paint_loop(&painter, vr, &z.lasso, cur, col);
+            }
         }
         if self.drawing && self.box_drag.is_none() {
-            let which = if z.pan { if end_box { "end box" } else { "start box" } } else { "box" };
+            let which = if multi { format!("point {}'s box", k + 1) } else { "box".to_string() };
             let msg = format!("Drag on the video to draw zone {}'s {which}", i + 1);
             let at = egui::pos2(vr.center().x, vr.top() + 18.0);
             let galley = painter.layout_no_wrap(msg, egui::FontId::proportional(14.0), Color32::WHITE);
@@ -1730,15 +1818,11 @@ impl Editor {
                     BoxDrag::Move(off) => ZBox { x: f.0 - off.0, y: f.1 - off.1, s: cur.s }.clamped(),
                 };
                 let z = &mut self.zones[i];
-                if end_box {
-                    z.b = nb;
-                    z.b_drawn = true;
-                } else {
+                if k == 0 {
                     z.a = nb;
                     z.a_drawn = true;
-                    if !z.pan {
-                        z.b = nb;
-                    }
+                } else {
+                    z.points[k - 1].b = nb;
                 }
             }
         }
@@ -1756,6 +1840,7 @@ impl Editor {
         painter.rect_filled(rect, 3.0, theme::CARD.gamma_multiply(0.6));
         let enabled = self.zoom_allowed();
         let mut spans: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut marks: Vec<(usize, usize, f32)> = Vec::new();
         for (i, z) in self.zones.iter().enumerate() {
             let Some((s, e)) = z.times() else { continue };
             if e <= s {
@@ -1775,10 +1860,29 @@ impl Editor {
                 painter.text(r.center(), egui::Align2::CENTER_CENTER, format!("{}", i + 1), egui::FontId::proportional(11.0), Color32::BLACK);
             }
             spans.push((i, r));
+            // Precise points: a diamond for each (point 1 sits on the zone start).
+            if z.uses_points() && !z.points.is_empty() {
+                let problems = z.point_problems();
+                for k in 0..=z.points.len() {
+                    let Some(t) = (if k == 0 { Some(s) } else { z.points[k - 1].t() }) else { continue };
+                    let x = x_of(t.clamp(s, e)).clamp(r.left() + 3.0, r.right() - 3.0);
+                    let used = k == 0 || problems[k - 1].is_none();
+                    let on = sel && self.edit_point == k;
+                    marks.push((i, k, x));
+                    let c = egui::pos2(x, rect.center().y);
+                    let d = if on { 5.5 } else { 4.5 };
+                    let shape = vec![c + egui::vec2(0.0, -d), c + egui::vec2(d, 0.0), c + egui::vec2(0.0, d), c + egui::vec2(-d, 0.0)];
+                    let fill = if on { Color32::WHITE } else if used { Color32::from_black_alpha(200) } else { Color32::TRANSPARENT };
+                    let stroke = Stroke::new(1.0, if on { Color32::BLACK } else if used { Color32::WHITE } else { Color32::from_gray(140) });
+                    painter.add(egui::Shape::convex_polygon(shape, fill, stroke));
+                }
+            }
         }
         if !enabled {
             return;
         }
+        // A point marker under the pointer (point 1 only for clicking: its edge drags the zone).
+        let mark_at = |p: egui::Pos2, movable: bool| marks.iter().filter(|m| !movable || m.1 > 0).find(|m| (p.x - m.2).abs() < 5.0 && rect.contains(p)).map(|m| (m.0, m.1));
         let edge_at = |p: egui::Pos2| -> Option<(usize, bool)> {
             spans.iter().find_map(|&(i, r)| {
                 if (p.x - r.left()).abs() < 5.0 {
@@ -1792,28 +1896,51 @@ impl Editor {
         };
         let zone_at = |p: egui::Pos2| spans.iter().find(|s| s.1.contains(p)).map(|s| s.0);
         if let Some(p) = resp.hover_pos() {
-            if edge_at(p).is_some() || self.band_drag.is_some() {
+            if mark_at(p, true).is_some() || edge_at(p).is_some() || self.band_drag.is_some() || self.point_drag.is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             } else if zone_at(p).is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if let Some(i) = zone_at(p) {
+            if let Some((i, k)) = mark_at(p, false) {
+                if let Some((t, _)) = self.zones[i].point(k) {
+                    let how = if k == 0 { "click to edit" } else { "click to edit, drag to move" };
+                    resp.clone().on_hover_text(format!("Zone {} point {}: {} ({how})", i + 1, k + 1, timecode::format_short(t)));
+                }
+            } else if let Some(i) = zone_at(p) {
                 if let Some((s, e)) = self.zones[i].times() {
-                    resp.clone().on_hover_text(format!("Zone {}: {} - {}", i + 1, timecode::format_short(s), timecode::format_short(e)));
+                    let more = if self.zones[i].uses_points() { "\nDouble-click to add a point there" } else { "" };
+                    resp.clone().on_hover_text(format!("Zone {}: {} - {}{more}", i + 1, timecode::format_short(s), timecode::format_short(e)));
                 }
             }
         }
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
-                self.band_drag = edge_at(p);
-                if let Some((i, _)) = self.band_drag {
+                if let Some((i, k)) = mark_at(p, true) {
+                    self.point_drag = Some((i, k));
                     self.sel_zone = Some(i);
-                    self.edit_end_box = false;
+                    self.edit_point = k;
                     self.drawing = false;
+                } else {
+                    self.band_drag = edge_at(p);
+                    if let Some((i, _)) = self.band_drag {
+                        self.sel_zone = Some(i);
+                        self.edit_point = 0;
+                        self.drawing = false;
+                    }
                 }
             }
         }
         if resp.dragged() {
+            if let (Some((i, k)), Some(p)) = (self.point_drag, resp.interact_pointer_pos()) {
+                // Kept inside the zone; the card says if it lands somewhere unusable.
+                if let Some((s, e)) = self.zones[i].times() {
+                    let t = t_of(p.x).clamp(s, e);
+                    if let Some(key) = self.zones[i].points.get_mut(k - 1) {
+                        key.text = timecode::format_compact(t);
+                    }
+                    self.scrub_to(t);
+                }
+            }
             if let (Some((i, is_start)), Some(p)) = (self.band_drag, resp.interact_pointer_pos()) {
                 let t = t_of(p.x);
                 let z = &mut self.zones[i];
@@ -1827,11 +1954,24 @@ impl Editor {
         }
         if resp.drag_stopped() {
             self.band_drag = None;
+            if let Some((i, k)) = self.point_drag.take() {
+                self.edit_point = self.zones[i].sort_points(k);
+            }
             self.end_scrub();
         }
-        if resp.clicked() {
-            if let Some(i) = resp.interact_pointer_pos().and_then(zone_at) {
-                self.select_zone(i);
+        if resp.double_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                if let Some(i) = zone_at(p).filter(|&i| self.zones[i].uses_points() && mark_at(p, false).is_none()) {
+                    self.add_zone_point(i, t_of(p.x));
+                }
+            }
+        } else if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                if let Some((i, k)) = mark_at(p, false) {
+                    self.goto_zone_box(i, k, false);
+                } else if let Some(i) = zone_at(p) {
+                    self.select_zone(i);
+                }
             }
         }
     }
@@ -2591,13 +2731,14 @@ impl Editor {
         });
         let blocked = self.zoom_blocked_reason();
         let pos = self.position();
-        let edit_end_box = self.edit_end_box;
+        let edit_point = self.edit_point;
         let sel_zone = self.sel_zone;
         let drawing_now = self.drawing;
         let fin_map = self.time_map();
         let fin_s0 = self.trim().map_or(0.0, |t| t.0);
         let (mut select, mut select_quiet, mut delete, mut draw) = (None, None, None, None);
-        let (mut pick, mut unlock) = (None, None);
+        let mut pick = None;
+        let (mut tab_changed, mut resort, mut remove_point, mut add_point) = (None, None, None, None);
         let tctx = self.track_ctx();
         let mut track_acts: Vec<(usize, track_ui::TrackAct)> = Vec::new();
         ui.add_enabled_ui(blocked.is_none(), |ui| {
@@ -2622,39 +2763,104 @@ impl Editor {
                             }
                         });
                     });
-                    // Box controls: start box on the left, end box on the right.
-                    ui.columns(2, |cols| {
-                        for (c, end) in [false, true].into_iter().enumerate() {
-                            let ui = &mut cols[c];
-                            ui.label(RichText::new(if end { "End box" } else { "Start box" }).small().color(theme::MUTED));
-                            let locked = end && !z.pan;
-                            let drawn = if end { z.b_drawn } else { z.a_drawn };
-                            let this_box = selected && (edit_end_box && z.pan) == end;
-                            ui.add_enabled_ui(!locked, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    if ui
-                                        .add_enabled(!drawn, egui::Button::selectable(this_box && drawing_now, "Draw box"))
-                                        .on_hover_text("Drag on the video to draw this box")
-                                        .on_disabled_hover_text(if locked { "No box change is on" } else { "Already drawn. Use Redraw to start again." })
-                                        .clicked()
-                                    {
-                                        draw = Some((i, end));
-                                    }
-                                    if ui
-                                        .add_enabled(drawn, egui::Button::selectable(this_box && !drawing_now, "Select box"))
-                                        .on_hover_text("Show this box on the video to move or resize it")
-                                        .clicked()
-                                    {
-                                        pick = Some((i, end));
-                                    }
-                                    if ui.add_enabled(drawn, egui::Button::new("Redraw")).on_hover_text("Throw this box away and draw a new one").clicked() {
-                                        draw = Some((i, end));
-                                    }
-                                });
-                            });
+                    // Simple / Precise tabs.
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(z.mode == zoom::Mode::Simple, "Simple").on_hover_text("One box: the same zoom from start to end").clicked() && z.mode != zoom::Mode::Simple {
+                            z.mode = zoom::Mode::Simple;
+                            tab_changed = Some(i);
+                        }
+                        if ui.selectable_label(z.mode == zoom::Mode::Precise, "Precise").on_hover_text("The camera moves: through points you set, or following something").clicked() && z.mode != zoom::Mode::Precise {
+                            z.mode = zoom::Mode::Precise;
+                            tab_changed = Some(i);
                         }
                     });
+                    if z.mode == zoom::Mode::Precise {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Move by").small().color(theme::MUTED));
+                            if ui.selectable_label(!z.follow, "My points").on_hover_text("The camera flows through points you place").clicked() && z.follow {
+                                z.follow = false;
+                                tab_changed = Some(i);
+                            }
+                            if ui.selectable_label(z.follow, "Follow automatically").on_hover_text("The camera follows something moving, like a player").clicked() && !z.follow {
+                                z.follow = true;
+                                tab_changed = Some(i);
+                            }
+                        });
+                    }
+                    let points = z.uses_points();
+                    // The first box (Simple's box, Precise's point 1).
+                    let edit_k = if selected { edit_point } else { usize::MAX };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let label = if points { "Point 1  (zone start)" } else if z.follows() { "Box to follow" } else { "Box" };
+                        ui.label(RichText::new(label).small().color(theme::MUTED));
+                        box_buttons(ui, z.a_drawn, edit_k == 0, drawing_now, &mut draw, &mut pick, (i, 0));
+                    });
+                    if points {
+                        let problems = z.point_problems();
+                        // Where each point is reached (point 1: one glide in), for "Insert between".
+                        let start_at = z.times().map(|t| t.0 + z.glide_used());
+                        let reached: Vec<Option<f64>> = std::iter::once(start_at)
+                            .chain(z.points.iter().zip(&problems).map(|(p, why)| if why.is_none() { p.t() } else { None }))
+                            .collect();
+                        // Above point k+1's row: halfway between point k and point k+1.
+                        let insert_at: Vec<(usize, f64)> = (1..reached.len())
+                            .filter_map(|k| {
+                                let mid = (reached[k - 1]? + reached[k]?) / 2.0;
+                                add_point_blocked(z, mid).is_none().then_some((k, mid))
+                            })
+                            .collect();
+                        for (j, key) in z.points.iter_mut().enumerate() {
+                            let k = j + 1;
+                            ui.separator();
+                            if let Some(&(_, mid)) = insert_at.iter().find(|x| x.0 == k)
+                                && ui
+                                    .small_button(format!("+ Insert between {k} and {}", k + 1))
+                                    .on_hover_text(format!("Add a point halfway, at {}", timecode::format_short(mid)))
+                                    .clicked()
+                            {
+                                add_point = Some((i, mid));
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("Point {}", k + 1)).small().color(if problems[j].is_some() { theme::MUTED } else { col }));
+                                let r = ui.add(egui::TextEdit::singleline(&mut key.text).desired_width(90.0));
+                                if r.lost_focus() {
+                                    resort = Some(i);
+                                }
+                                if ui.small_button("Use playhead").clicked() {
+                                    key.text = timecode::format_compact(pos);
+                                    resort = Some(i);
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                box_buttons(ui, true, edit_k == k, drawing_now, &mut draw, &mut pick, (i, k));
+                                if ui.small_button("Remove").on_hover_text("Remove this point").clicked() {
+                                    remove_point = Some((i, k));
+                                }
+                            });
+                            match &problems[j] {
+                                Some(why) => theme::warn(ui, why.clone()),
+                                None => {
+                                    if let Some(f) = final_text(&fin_map, fin_s0, &key.text) {
+                                        theme::hint(ui, f);
+                                    }
+                                }
+                            }
+                        }
+                        let blocked_add = add_point_blocked(z, pos);
+                        if ui
+                            .add_enabled(blocked_add.is_none(), egui::Button::new("+ Add point at playhead").min_size(egui::vec2(ui.available_width(), 22.0)))
+                            .on_hover_text("Pause where the camera should be somewhere else, click this, then move or resize the box")
+                            .on_disabled_hover_text(blocked_add.unwrap_or(""))
+                            .clicked()
+                        {
+                            add_point = Some((i, pos));
+                        }
+                        if z.points.is_empty() {
+                            theme::hint(ui, "Pause where the thing you're zooming on has moved and add a point. The camera flows smoothly through every point.");
+                        }
+                    }
                     ui.columns(2, |cols| {
                         for (c, (label, text)) in [("Start", &mut z.start_text), ("End", &mut z.end_text)].into_iter().enumerate() {
                             let ui = &mut cols[c];
@@ -2673,35 +2879,13 @@ impl Editor {
                             }
                         }
                     });
-                    // Under the times: Smooth on the left, No box change on the right.
-                    ui.columns(2, |cols| {
-                        cols[0].horizontal(|ui| {
-                            ui.checkbox(&mut z.smooth, "Smooth").on_hover_text("Glide in and out of the zoom. Off: cut straight in and out.");
-                            if z.smooth {
-                                ui.add(egui::DragValue::new(&mut z.glide).range(0.1..=2.0).speed(0.01).max_decimals(2).suffix(" s glide"));
-                            }
-                        });
-                        if cols[1]
-                            .selectable_label(!z.pan, "No box change")
-                            .on_hover_text("On: the zoom stays on the start box for the whole zone. Off: it pans from the start box to an end box.")
-                            .clicked()
-                        {
-                            if z.pan {
-                                z.pan = false;
-                            } else {
-                                unlock = Some(i);
-                            }
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut z.smooth, "Smooth").on_hover_text("Glide in and out of the zoom. Off: cut straight in and out.");
+                        if z.smooth {
+                            ui.add(egui::DragValue::new(&mut z.glide).range(0.1..=2.0).speed(0.01).max_decimals(2).suffix(" s glide"));
                         }
                     });
-                    if ui
-                        .checkbox(&mut z.track, "Track: follow what's in the box")
-                        .on_hover_text("The zoom follows something moving, like a player. Draw the start box around it, then click Track.")
-                        .changed()
-                        && z.track
-                    {
-                        z.pan = false;
-                    }
-                    if z.track {
+                    if z.follows() {
                         if let Some(a) = track_ui::track_controls(ui, i, z, &tctx) {
                             track_acts.push((i, a));
                         }
@@ -2722,7 +2906,7 @@ impl Editor {
             ui.add_enabled(!full, egui::Button::new(label).min_size(egui::vec2(ui.available_width(), 26.0)))
                 .on_disabled_hover_text("You can have up to 20 zones. Delete one to add another.")
                 .clicked()
-                .then(|| draw = Some((usize::MAX, false)));
+                .then(|| draw = Some((usize::MAX, 0)));
             if !self.zones.is_empty() {
                 ui.checkbox(&mut self.settings.zoom_static_preview, "Static zoom preview")
                     .on_hover_text("Result shows box outlines instead of zooming live.");
@@ -2747,30 +2931,40 @@ impl Editor {
         for (i, a) in track_acts {
             self.apply_track_act(i, a);
         }
+        if let Some(i) = tab_changed {
+            // Only point 1 exists outside "My points".
+            if self.sel_zone == Some(i) && !self.zones[i].uses_points() {
+                self.edit_point = 0;
+            }
+        }
+        if let Some(i) = resort {
+            let keep = if self.sel_zone == Some(i) { self.edit_point } else { 0 };
+            let k = self.zones[i].sort_points(keep);
+            if self.sel_zone == Some(i) {
+                self.edit_point = k;
+            }
+        }
         if let Some(i) = delete {
             self.sel_zone = Some(i);
             self.delete_selected_zone();
-        } else if let Some((i, end_box)) = draw {
+        } else if let Some((i, k)) = remove_point {
+            self.remove_zone_point(i, k);
+        } else if let Some((i, t)) = add_point {
+            self.add_zone_point(i, t);
+        } else if let Some((i, k)) = draw {
             if i == usize::MAX {
                 self.new_zone();
             } else {
-                self.goto_zone_box(i, end_box, true);
+                self.goto_zone_box(i, k, true);
             }
-        } else if let Some((i, end_box)) = pick {
-            self.goto_zone_box(i, end_box, false);
-        } else if let Some(i) = unlock {
-            // Pan from here: the end box starts undrawn, ready to draw.
-            let z = &mut self.zones[i];
-            z.pan = true;
-            z.b = z.a;
-            z.b_drawn = false;
-            self.goto_zone_box(i, true, true);
+        } else if let Some((i, k)) = pick {
+            self.goto_zone_box(i, k, false);
         } else if let Some(i) = select {
             self.select_zone(i);
         } else if let Some(i) = select_quiet {
             self.sel_zone = Some(i);
             self.sel_speed = None;
-            self.edit_end_box = false;
+            self.edit_point = 0;
         }
     }
 
@@ -3269,6 +3463,45 @@ fn gpu_name(enc: &str) -> &'static str {
     } else {
         "your Intel graphics (Quick Sync)"
     }
+}
+
+/// Draw box / Select box / Redraw for one zone box (`at` = zone, point).
+fn box_buttons(ui: &mut egui::Ui, drawn: bool, this_box: bool, drawing: bool, draw: &mut Option<(usize, usize)>, pick: &mut Option<(usize, usize)>, at: (usize, usize)) {
+    if !drawn && ui.add(egui::Button::selectable(this_box && drawing, "Draw box")).on_hover_text("Drag on the video to draw this box").clicked() {
+        *draw = Some(at);
+    }
+    if ui.add_enabled(drawn, egui::Button::selectable(this_box && !drawing, "Select box")).on_hover_text("Jump here and show this box on the video to move or resize it").clicked() {
+        *pick = Some(at);
+    }
+    if ui.add_enabled(drawn, egui::Button::new("Redraw")).on_hover_text("Throw this box away and draw a new one").clicked() {
+        *draw = Some(at);
+    }
+}
+
+/// Where to show zone point `k` (0 = the first box): its time, kept on a
+/// frame inside the zone.
+fn point_frame(z: &Zone, k: usize, frame: f64) -> Option<f64> {
+    let (s, e) = z.times()?;
+    let t = z.point(k).map_or(s, |p| p.0);
+    Some(t.min(e - frame).max(s))
+}
+
+/// Why a Precise point can't be added to `z` at `pos` (None = it can).
+fn add_point_blocked(z: &Zone, pos: f64) -> Option<&'static str> {
+    let (s, e) = z.times()?;
+    if z.points.len() + 1 >= zoom::MAX_POINTS {
+        return Some("A zone can have up to 20 points. Remove one to add another.");
+    }
+    if pos <= s || pos >= e {
+        return Some("Move the playhead inside the zone first");
+    }
+    if !z.a_drawn {
+        return Some("Draw point 1's box first");
+    }
+    if z.points.iter().any(|p| p.t().is_some_and(|t| (t - pos).abs() < zoom::SAME_TIME)) {
+        return Some("There's already a point here");
+    }
+    None
 }
 
 fn time_feedback(ui: &mut egui::Ui, text: &str) {
