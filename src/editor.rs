@@ -491,11 +491,20 @@ impl Editor {
         Some(discord::plan(cap, job::output_duration(s, e, &self.active_speeds()), v.width, v.height, v.fps, has_audio))
     }
 
+    /// The cut mode the export will use. Kept apart from `effective_opts()`
+    /// on purpose: `effective_opts()` -> `discord_plan()` -> `active_speeds()`
+    /// -> `speed_blocked_reason()` needs the mode, and going back through
+    /// `effective_opts()` would recurse forever. A Discord preset always
+    /// forces Precise (see `Options::with_preset_basics`).
+    fn effective_mode(&self) -> CutMode {
+        if self.discord_active() { CutMode::Precise } else { self.settings.options.mode }
+    }
+
     /// Why the speed tools are greyed out, if they are.
     fn speed_blocked_reason(&self) -> Option<&'static str> {
         match &self.media {
             None => Some("Open a video first."),
-            _ if self.effective_opts().mode == CutMode::Fast => Some("Switch to Precise to change speed. Fast mode copies the clip untouched."),
+            _ if self.effective_mode() == CutMode::Fast => Some("Switch to Precise to change speed. Fast mode copies the clip untouched."),
             _ => None,
         }
     }
